@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+export UV_CACHE_DIR="${TMPDIR:-/tmp}/s2-uv-cache"
+
+# Remove cached uv environments missing pyvenv.cfg — without that file,
+# Python doesn't recognize the directory as a virtualenv and uv falls back
+# to installing packages into the managed Python path, which fails in sandboxed environments.
+for env_dir in "$UV_CACHE_DIR"/environments-*/s2-*/; do
+  [ -d "$env_dir" ] && [ ! -f "$env_dir/pyvenv.cfg" ] && rm -rf "$env_dir"
+done
+
+exec uv run "$(dirname "$0")/s2.py" "$@"
