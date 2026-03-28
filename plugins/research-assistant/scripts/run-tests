@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export UV_CACHE_DIR="${TMPDIR:-/tmp}/s2-test-cache"
+exec uv run "$(dirname "$0")/run-tests.py" "$@"

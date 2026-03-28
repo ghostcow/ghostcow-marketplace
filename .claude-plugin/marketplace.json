@@ -1,0 +1,27 @@
+{
+  "name": "ghostcow-marketplace",
+  "owner": {
+    "name": "ghostcow"
+  },
+  "metadata": {
+    "description": "Personal plugin collection by ghostcow",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "ruff-hooks",
+      "source": "ruff-hooks",
+      "description": "Runs ruff check and format on Python files after every Write, Edit, or MultiEdit"
+    },
+    {
+      "name": "catline-status",
+      "source": "catline-status",
+      "description": "Claude Code statusline with model, git branch, context, and cat animations"
+    },
+    {
+      "name": "research-assistant",
+      "source": "research-assistant",
+      "description": "Academic research assistant powered by Semantic Scholar"
+    }
+  ]
+}

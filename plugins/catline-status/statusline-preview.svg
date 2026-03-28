@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="44">
+  <rect width="720" height="44" rx="6" fill="#1e1e2e"/>
+  <text y="28" font-family="monospace" font-size="14">
+    <tspan x="12" fill="#ff87d7">(=^&#8270;^=)</tspan>
+    <tspan fill="#afafff"> Opus 4.6</tspan>
+    <tspan fill="#87afff"> @ airis-marketplace</tspan>
+    <tspan fill="#d7afff"> &#x2192; catline-status-plugin</tspan>
+    <tspan fill="#87afaf"> remaining context: 69%</tspan>
+  </text>
+</svg>

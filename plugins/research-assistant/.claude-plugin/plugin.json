@@ -1,0 +1,10 @@
+{
+  "name": "research-assistant",
+  "description": "Academic research assistant powered by Semantic Scholar",
+  "version": "1.0.0",
+  "author": {
+    "name": "Lior Uzan"
+  },
+  "license": "MIT",
+  "keywords": ["academic", "papers", "citations", "semantic-scholar", "research"]
+}
