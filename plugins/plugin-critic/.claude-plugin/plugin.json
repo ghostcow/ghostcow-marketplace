@@ -1,0 +1,10 @@
+{
+  "name": "plugin-critic",
+  "version": "1.0.0",
+  "description": "Reviews Claude Code plugin changes on PRs using rubric-driven evaluation with expectation-grounded assessment. Per-evaluator context routing gives each evaluator only the system facts and change analysis relevant to its criteria. Evaluators construct expectations before reading plugin files, then assess against five quality dimensions organized into three independent groups.",
+  "author": {
+    "name": "Airis"
+  },
+  "license": "MIT",
+  "keywords": ["review", "plugin", "design", "debiasing", "prompt-architecture"]
+}

@@ -22,6 +22,11 @@
       "name": "research-assistant",
       "source": "./plugins/research-assistant",
       "description": "Academic research assistant powered by Semantic Scholar"
+    },
+    {
+      "name": "plugin-critic",
+      "source": "./plugins/plugin-critic",
+      "description": "Reviews Claude Code plugin PRs using rubric-driven evaluation with expectation-grounded assessment across five quality dimensions."
     }
   ]
 }

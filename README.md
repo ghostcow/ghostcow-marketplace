@@ -14,6 +14,7 @@ Then install individual plugins:
 /plugin install ruff-hooks@ghostcow-marketplace
 /plugin install catline-status@ghostcow-marketplace
 /plugin install research-assistant@ghostcow-marketplace
+/plugin install plugin-critic@ghostcow-marketplace
 ```
 
 ## Plugins
@@ -23,3 +24,4 @@ Then install individual plugins:
 | **ruff-hooks** | Runs ruff check (with auto-fix) and ruff format on Python files after every Write, Edit, or MultiEdit. Blocks Claude on unfixable linting violations. |
 | **catline-status** | Claude Code statusline showing model, working directory, git branch, and remaining context — with rotating cat face animations. |
 | **research-assistant** | Academic research assistant powered by Semantic Scholar. Search papers, explore citation networks, and synthesize findings. |
+| **plugin-critic** | Reviews Claude Code plugin changes on PRs using rubric-driven evaluation with expectation-grounded assessment. Uses per-evaluator context routing across five quality dimensions in three independent evaluator groups. |
