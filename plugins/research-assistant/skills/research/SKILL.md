@@ -8,7 +8,7 @@ allowed-tools: Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch
 
 # s2 — Semantic Scholar CLI
 
-`s2` is a CLI tool installed into PATH by a session-start hook.
+`s2` is a CLI tool available on PATH whenever this plugin is enabled.
 Every command outputs one JSON object per line to stdout. Errors go
 to stderr. All IDs accept S2 paper IDs, DOI:..., ArXiv:..., CorpusId:...,
 PMID:..., PMCID:..., ACL:..., or URL from semanticscholar.org / arxiv.org.
