@@ -1,7 +1,7 @@
 {
   "name": "research-assistant",
   "description": "Academic research assistant powered by Semantic Scholar",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "author": {
     "name": "Lior Uzan"
   },
