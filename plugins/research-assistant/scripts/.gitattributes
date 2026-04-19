@@ -1,2 +1,1 @@
-s2 text eol=lf
 run-tests text eol=lf
