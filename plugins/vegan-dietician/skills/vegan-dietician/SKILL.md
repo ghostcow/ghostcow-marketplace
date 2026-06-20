@@ -25,6 +25,7 @@ When there is no profile yet (or the user wants to redo it), gather the full set
 - **Allergies.**
 - **Likes, dislikes, and constraints** — including anything like soy-free.
 - **Supplements** they take.
+- **USDA API key** *(optional)* — for calorie lookups. If they have one, save it; if not, lookups fall back to a shared demo key.
 
 Then compute the daily calorie target (see `references/menu-building.md`), show the assembled profile and target back to the user, and adjust to their input. Save it to memory, pinning the calorie target and allergies so they hold across sessions.
 
