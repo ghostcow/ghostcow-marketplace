@@ -9,7 +9,7 @@ Look up real values from these databases instead of estimating from memory — t
 
 ## USDA FoodData Central
 
-Base: `https://api.nal.usda.gov/fdc/v1` — append `&api_key=<your USDA key>` to every call.
+Base: `https://api.nal.usda.gov/fdc/v1` — append `&api_key=…` to every call. Read the user's USDA key from their profile/memory; if none is set, use `DEMO_KEY` (works with no setup, but rate-limited to ~30/hour).
 
 - Ingredient: `/foods/search?query=<food>&dataType=Foundation,SR Legacy`
 - Prepared or mixed dish: `/foods/search?query=<dish>&dataType=Survey (FNDDS)`
