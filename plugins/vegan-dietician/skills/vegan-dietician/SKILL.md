@@ -14,7 +14,7 @@ Read the user's data — kept in this project's memory, their private per-person
 - **Current menu** — what they're eating now.
 - **Saved recipes** — dishes they've asked you to keep.
 
-If there is no profile yet (or the user asks to redo it), run the one-time intake in `references/profile-intake.md` before building menus.
+If there is no profile yet (or the user asks to redo it), run the one-time intake in `references/profile-intake.md` first — the profile grounds everything you do here.
 
 ## How to work
 

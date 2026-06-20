@@ -1,6 +1,6 @@
 # Profile intake (first run)
 
-Run this once — when there is no profile yet, or when the user asks to redo it. Gather the full set of details before building any menus. It is a finite list, so ask for all of it, and take the space it needs:
+Run this once — when there is no profile yet, or when the user asks to redo it. Gather the full set of details up front; the profile grounds everything the coach does — calorie answers, menus, swaps, and recipes alike — not just menus. It is a finite list, so ask for all of it, and take the space it needs:
 
 - **Body stats** — weight, height, age, and sex (these set the calorie estimate).
 - **Activity level** — from sedentary to very active.
