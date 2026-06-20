@@ -27,6 +27,11 @@
       "name": "plugin-critic",
       "source": "./plugins/plugin-critic",
       "description": "Reviews Claude Code plugin PRs using rubric-driven evaluation with expectation-grounded assessment across five quality dimensions."
+    },
+    {
+      "name": "vegan-dietician",
+      "source": "./plugins/vegan-dietician",
+      "description": "Personal vegan nutrition coach — builds and refines a weekly menu, answers calorie/food questions from USDA & Open Food Facts, and saves your recipes."
     }
   ]
 }

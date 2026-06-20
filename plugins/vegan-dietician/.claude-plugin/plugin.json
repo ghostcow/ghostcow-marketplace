@@ -1,0 +1,10 @@
+{
+  "name": "vegan-dietician",
+  "description": "Personal vegan nutrition coach: builds and refines a weekly menu, answers calorie and food questions from authoritative databases (USDA FoodData Central, Open Food Facts), and saves and reuses your recipes.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Lior Uzan"
+  },
+  "license": "MIT",
+  "keywords": ["vegan", "nutrition", "dietician", "menu", "calories", "weight-loss", "plant-based"]
+}
