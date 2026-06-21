@@ -30,9 +30,3 @@ So a plain ingredient leans Foundation or SR Legacy, a cooked or mixed dish lean
 ## Open Food Facts query shape
 
 `GET /search?q=<terms> countries_tags:"en:israel"&langs=he,en&fields=product_name,brands,code,nutriments&page_size=5`. The `q` field is Lucene, so combine free text with filters like `labels_tags:"en:vegan"` or a kcal range `nutriments.energy-kcal_100g:[* TO 150]`. Exact product by barcode: `https://world.openfoodfacts.org/api/v2/product/{barcode}`.
-
-## Worked example — "calories in oats"
-
-1. **Form?** The menu says *cooked* oats, so you want an as-eaten figure.
-2. **Source?** Cooked → FNDDS (`oatmeal`) gives ~75/100g, or SR Legacy "Cereals, oats … cooked with water" ~71/100g. (Dry would be Foundation/SR Legacy, ~380/100g.)
-3. **Read the list,** skip oat oil / bran / cookies, take the oats entry, read its energy (`1008`, or Atwater `957`/`958`), and scale to the portion.
