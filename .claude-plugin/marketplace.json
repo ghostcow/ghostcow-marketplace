@@ -27,6 +27,11 @@
       "name": "plugin-critic",
       "source": "./plugins/plugin-critic",
       "description": "Reviews Claude Code plugin PRs using rubric-driven evaluation with expectation-grounded assessment across five quality dimensions."
+    },
+    {
+      "name": "paper-reading-guide",
+      "source": "./plugins/paper-reading-guide",
+      "description": "Turn a paper (arXiv/DOI/PMC/URL/PDF) into a structured reading guide — obtain the full text, render its figure pages, read it in full, and map where everything is and what's worth taking."
     }
   ]
 }
