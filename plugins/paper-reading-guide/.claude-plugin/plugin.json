@@ -1,0 +1,10 @@
+{
+  "name": "paper-reading-guide",
+  "version": "1.0.0",
+  "description": "Turn a paper (arXiv/DOI/PMC/URL/PDF) into a structured reading guide — obtain the full text, render its figure pages, read it in full, and map where everything is and what's worth taking.",
+  "author": {
+    "name": "Lior Uzan"
+  },
+  "license": "MIT",
+  "keywords": ["papers", "pdf", "research", "reading-guide", "literature", "figures", "summarization"]
+}
