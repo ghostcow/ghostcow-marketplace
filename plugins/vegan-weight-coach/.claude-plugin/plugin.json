@@ -1,0 +1,8 @@
+{
+  "name": "vegan-weight-coach",
+  "version": "0.1.0",
+  "description": "Long-term coach for people who already eat strictly plant-based: sustainable, non-judgmental weight-loss and eating-well support over months, backed by a file-based per-user memory the agent maintains.",
+  "author": { "name": "Lior Uzan" },
+  "license": "MIT",
+  "keywords": ["coaching", "vegan", "plant-based", "weight-loss", "nutrition", "behavior-change", "memory"]
+}
