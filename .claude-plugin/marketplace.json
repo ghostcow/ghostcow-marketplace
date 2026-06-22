@@ -27,6 +27,11 @@
       "name": "plugin-critic",
       "source": "./plugins/plugin-critic",
       "description": "Reviews Claude Code plugin PRs using rubric-driven evaluation with expectation-grounded assessment across five quality dimensions."
+    },
+    {
+      "name": "vegan-weight-coach",
+      "source": "./plugins/vegan-weight-coach",
+      "description": "Long-term vegan weight-loss coach for people who already eat strictly plant-based — sustainable, non-judgmental weight-loss and eating-well support, with a per-user memory the agent maintains."
     }
   ]
 }
