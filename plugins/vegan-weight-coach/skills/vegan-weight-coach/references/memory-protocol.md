@@ -13,7 +13,9 @@ files, kept separate so change-over-time is never lost:
   delete. Schemas in the store's `ledger/README.md`.
 - **Trajectory** (`trajectory/*.md`) — "how it changed"; regenerated during consolidation, not per turn.
 
-Read-only to you (the user owns them): `profile/constraints.md`, `reference/*`. Read them, never edit.
+**Authoritative** (`profile/constraints.md`, `reference/*`): treat as ground truth. Change them only
+when the user explicitly states a change; never alter them on your own inference, and re-confirm with
+the user rather than overwrite.
 
 **Read — at session start:** `INDEX.md` + `CURRENT.md` + `anchor.md` (always). Then only what the
 moment needs: a `state/*` file if INDEX's freshness list flags it or the topic comes up; a

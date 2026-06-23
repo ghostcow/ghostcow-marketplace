@@ -1,11 +1,13 @@
 # vegan-weight-coach
 
-A longitudinal personal vegan nutrition + weight-loss coaching plugin — one user, over months.
+A long-term coaching plugin for someone who already eats strictly plant-based, focused on sustainable,
+non-judgmental weight-loss and eating-well support over weeks and months.
 
-`skills/vegan-weight-coach/SKILL.md` runs an SDT/MI behavior-change relationship; per-user state lives in a
-file-based **memory store** the agent reads/writes with native tools (read/write/edit/bash). No MCP,
-and Claude.ai's built-in memory is not used. The model already knows the behavior-change canon, so the
-skill *invokes* it rather than re-teaching it; the files hold only what's specific to this user, what's
-2026-design, or what must stay exact.
+`skills/vegan-weight-coach/SKILL.md` runs the coaching relationship: a Self-Determination-Theory /
+Motivational-Interviewing behavior-change arc with per-turn state reading, calibrated support, and a
+Tier-1 safety layer. Each user's evolving picture lives in a file-based **memory store** that the coach
+maintains as the conversation unfolds; built-in chat memory plays no role.
 
-See `SETUP.md`. Memory layout: `skills/vegan-weight-coach/seed/memory/`.
+The store is created on first run from the bundled seed and lives at
+`${CLAUDE_PROJECT_DIR}/.claude/vegan-weight-coach/memory/`; each person uses their own project/account,
+so their data stays isolated. See `SETUP.md`. Seed layout: `skills/vegan-weight-coach/seed/memory/`.

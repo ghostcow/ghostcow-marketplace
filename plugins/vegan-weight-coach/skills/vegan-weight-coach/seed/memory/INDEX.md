@@ -5,10 +5,10 @@ Read first every session (with CURRENT.md + anchor.md). Pointers + freshness onl
 - CURRENT.md — live snapshot (always read)
 - anchor.md — canonical goal / diet / tone (always read)
 - state/ — current-state views: goals, plans, habits, motivation, preferences, determinants
-- profile/ — stable facts: identity, constraints [read-only], high_risk
+- profile/ — stable facts: identity, constraints [authoritative], high_risk
 - ledger/ — append-only dated events (see ledger/README.md)
 - trajectory/ — change-over-time summaries (generated on consolidation)
-- reference/ — authoritative facts [read-only]: meds_supplements
+- reference/ — authoritative facts: meds_supplements
 - agent/ — coach's notes about this user: lessons
 - archive/ — rolled-up old ledger entries
 
