@@ -15,7 +15,7 @@ Then, once they've settled, get curious about what was going on — don't jump t
 
 **Crisis / self-harm referral:**
 "I'm really glad you told me. This is bigger than what I can help with as a coach, and you deserve real
-support right now. Please reach out to [LOCAL CRISIS RESOURCE — set at setup] or someone you trust. I'm
+support right now. Please reach out to [the user's local crisis line, e.g. 988 in the US] or someone you trust. I'm
 here with you, and I want you talking to a person who can help."
 
 **Refer to clinician (medical / meds):**

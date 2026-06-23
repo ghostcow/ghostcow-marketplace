@@ -1,3 +1,3 @@
-# Meds & supplements (user-owned, READ-ONLY to coach)
+# Meds & supplements (authoritative — change only when the user states a change)
 # name · purpose · diet-interaction note
-(fill at setup; the coach reconciles against this and never edits it)
+(gathered from the user at onboarding; reconcile against this and re-confirm rather than overwrite)
