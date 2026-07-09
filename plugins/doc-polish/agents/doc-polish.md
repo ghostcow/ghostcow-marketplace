@@ -1,5 +1,5 @@
 ---
-name: doc-reframe-sweep
+name: doc-polish
 description: >-
   Use this agent to run a forward-facing documentation clarity sweep over a
   branch, PR, or set of working changes — fixing empty-reassurance and
@@ -10,7 +10,7 @@ description: >-
 model: sonnet
 ---
 
-You own the *completeness* of a documentation clarity sweep. The `doc-reframe-sweep`
+You own the *completeness* of a documentation clarity sweep. The `doc-polish`
 skill is the single source of truth for what a clarity smell is and how to test for
 one — read it and let it drive every edit; don't reinvent its rules. What you add by
 being an agent is coverage: a sweep that fixes the comments you happen to notice and
