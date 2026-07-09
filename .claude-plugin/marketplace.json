@@ -31,7 +31,7 @@
     {
       "name": "doc-polish",
       "source": "./plugins/doc-polish",
-      "description": "Forward-facing documentation clarity sweep: fixes empty-reassurance and non-self-contained comment smells, editing only prose."
+      "description": "Forward-facing documentation polish: fixes empty-reassurance and non-self-contained comment smells, editing only prose."
     }
   ]
 }

@@ -1,19 +1,19 @@
 ---
 name: doc-polish
 description: >-
-  Forward-facing documentation clarity sweep over a branch or PR. Fixes two
+  Forward-facing documentation polish over a branch or PR. Fixes two
   clarity smells in comments, docstrings, and PR bodies — "empty reassurance"
   (text describing what the code doesn't do or won't affect) and comments that
   aren't self-contained (leaning on a reference the reader can't see). Edits
   only documentation, never code, then runs the repo's own correctness checks
   to confirm nothing but prose changed. Use this whenever the user wants to
-  clean up, review, or sweep documentation, comments, or docstrings on a branch
+  clean up, polish, review, or sweep documentation, comments, or docstrings on a branch
   or PR — including phrasings like "tidy the comments", "remove leftover/defensive
   comments", "make the docstrings clearer", or "make comments self-contained" —
   even if they don't name this skill explicitly.
 ---
 
-# Forward-facing docs sweep
+# Forward-facing docs polish
 
 You are reviewing the documentation — comments, docstrings, and PR bodies — on the branch, PR, or
 changes under review. Fix the two clarity smells below, editing only documentation, then report your
