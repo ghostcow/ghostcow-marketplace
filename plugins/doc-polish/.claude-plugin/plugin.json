@@ -1,5 +1,5 @@
 {
-  "name": "doc-reframe-sweep",
+  "name": "doc-polish",
   "version": "0.1.0",
   "description": "Forward-facing documentation clarity sweep: fixes empty-reassurance and non-self-contained comment smells, editing only prose.",
   "author": {

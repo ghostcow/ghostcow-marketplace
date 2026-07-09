@@ -1,5 +1,5 @@
 ---
-name: doc-reframe-sweep
+name: doc-polish
 description: >-
   Forward-facing documentation clarity sweep over a branch or PR. Fixes two
   clarity smells in comments, docstrings, and PR bodies — "empty reassurance"
