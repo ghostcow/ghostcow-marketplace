@@ -27,6 +27,11 @@
       "name": "plugin-critic",
       "source": "./plugins/plugin-critic",
       "description": "Reviews Claude Code plugin PRs using rubric-driven evaluation with expectation-grounded assessment across five quality dimensions."
+    },
+    {
+      "name": "doc-reframe-sweep",
+      "source": "./plugins/doc-reframe-sweep",
+      "description": "Forward-facing documentation clarity sweep: fixes empty-reassurance and non-self-contained comment smells, editing only prose."
     }
   ]
 }
