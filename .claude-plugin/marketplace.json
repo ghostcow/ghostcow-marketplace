@@ -22,6 +22,11 @@
       "name": "research-assistant",
       "source": "./plugins/research-assistant",
       "description": "Academic research assistant powered by Semantic Scholar"
+    },
+    {
+      "name": "doc-reframe-sweep",
+      "source": "./plugins/doc-reframe-sweep",
+      "description": "Forward-facing documentation clarity sweep: fixes empty-reassurance and non-self-contained comment smells, editing only prose."
     }
   ]
 }
