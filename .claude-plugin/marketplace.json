@@ -32,6 +32,11 @@
       "name": "doc-polish",
       "source": "./plugins/doc-polish",
       "description": "Forward-facing documentation polish: fixes empty-reassurance and non-self-contained comment smells, editing only prose."
+    },
+    {
+      "name": "atlassian-activity-summary",
+      "source": "./plugins/atlassian-activity-summary",
+      "description": "Summarizes what a person did in Jira and Confluence over a date range as pasteable status-update claims, each citing the issues behind it."
     }
   ]
 }

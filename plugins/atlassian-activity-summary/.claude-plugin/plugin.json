@@ -1,0 +1,9 @@
+{
+  "name": "atlassian-activity-summary",
+  "version": "0.1.0",
+  "description": "Summarizes what a person did in Jira and Confluence over a date range as pasteable status-update claims, each citing the issues behind it.",
+  "author": {
+    "name": "AI Agents Research",
+    "email": "lioruz@dreamgroup.com"
+  }
+}
