@@ -2,9 +2,10 @@
 name: doc-polish
 description: >-
   Use this agent to run a forward-facing documentation polish over a
-  branch, PR, or set of working changes — fixing empty-reassurance and
-  non-self-contained comment smells in comments, docstrings, and PR bodies while
-  editing only prose. Trigger it whenever the user asks to polish, sweep, tidy, or review
+  branch, PR, or set of working changes — fixing empty-reassurance,
+  non-self-contained comment, and decision-rationale-sediment smells in
+  comments, docstrings, and reference docs while editing only prose. Trigger
+  it whenever the user asks to polish, sweep, tidy, or review
   documentation/comments/docstrings for clarity on a branch or PR. The agent owns
   full coverage of the scope and proves it covered everything before finishing.
 model: sonnet
