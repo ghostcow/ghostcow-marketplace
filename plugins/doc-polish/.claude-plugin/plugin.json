@@ -1,7 +1,7 @@
 {
   "name": "doc-polish",
-  "version": "0.1.0",
-  "description": "Forward-facing documentation polish: fixes empty-reassurance and non-self-contained comment smells, editing only prose.",
+  "version": "0.2.0",
+  "description": "Forward-facing documentation polish: fixes empty-reassurance, non-self-contained comment, and decision-rationale-sediment smells, editing only prose.",
   "author": {
     "name": "AI Agents Research",
     "email": "lioruz@dreamgroup.com"
