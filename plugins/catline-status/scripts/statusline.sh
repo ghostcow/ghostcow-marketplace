@@ -24,6 +24,12 @@ dir=$(basename "$current_dir")
 # Show git branch only when current_dir is inside a repo
 branch=$(git -C "$current_dir" branch --show-current 2>/dev/null)
 
+# Truncate long branch names so they can't crowd out the context-remaining segment
+BRANCH_MAX_LEN=50
+if [ -n "$branch" ] && [ "${#branch}" -gt "$BRANCH_MAX_LEN" ]; then
+    branch="${branch:0:$((BRANCH_MAX_LEN - 1))}…"
+fi
+
 # ── Cat face ────────────────────────────────────
 sec=$(($(date +%S) % 20))
 case $sec in
