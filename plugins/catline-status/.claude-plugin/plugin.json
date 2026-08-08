@@ -1,6 +1,6 @@
 {
   "name": "catline-status",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Claude Code statusline showing model, working directory, git branch, and remaining context — with rotating cat face animations.",
   "author": {
     "name": "Airis"
