@@ -3,7 +3,6 @@ description: >
   Search and explore academic papers via Semantic Scholar.
   Use when the user asks about academic papers, citations,
   references, or research discovery.
-allowed-tools: Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch
 ---
 
 # s2 — Semantic Scholar CLI
