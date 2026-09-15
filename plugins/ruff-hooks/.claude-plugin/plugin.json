@@ -1,7 +1,7 @@
 {
   "name": "ruff-hooks",
-  "version": "1.0.0",
-  "description": "Runs ruff check (with auto-fix) and ruff format on Python files after every Write, Edit, or MultiEdit. Blocks Claude on unfixable linting violations. Merges with your project's ruff config if present, falls back to opinionated defaults otherwise.",
+  "version": "1.1.0",
+  "description": "Runs ruff check (with auto-fix) on Python files after every Write, Edit, or MultiEdit, and warns if the file isn't formatted (without rewriting it). Blocks Claude on unfixable linting violations. Merges with your project's ruff config if present, falls back to opinionated defaults otherwise.",
   "author": {
     "name": "Airis"
   },
@@ -15,10 +15,6 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/ruff_check.py"
-          },
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/ruff_format.py"
           }
         ]
       }
