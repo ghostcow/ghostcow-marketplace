@@ -1,23 +1,46 @@
 #!/usr/bin/env python3
 """
-PostToolUse hook for checking Python files after editing.
-This hook runs after Edit, Write, or MultiEdit operations and applies ruff checking.
+PostToolUse hook for checking and format-checking Python files after editing.
+This hook runs after Edit, Write, or MultiEdit operations, applies ruff linting
+(with auto-fix), and warns (without modifying the file) if it is not formatted.
 NOTE: Excludes import checks (F401) which are handled by the Stop hook.
 """
 
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 # Exit code constants
 HOOK_SUCCESS = 0  # Continue normally
 HOOK_WARN = 1  # Show output but don't block
 HOOK_BLOCK = 2  # Block Claude and show error
 
-# Ruff exit codes
+# Ruff check exit codes
 RUFF_SUCCESS = 0
 RUFF_VIOLATIONS = 1
 RUFF_ERROR = 2
+
+# Ruff format --check exit codes
+RUFF_FORMAT_OK = 0
+RUFF_FORMAT_WOULD_REFORMAT = 1
+
+
+def has_ruff_config(file_path):
+    """Check if a ruff config exists in the project by walking up from the file."""
+    current = Path(file_path).resolve().parent
+    for directory in [current, *current.parents]:
+        if (directory / "ruff.toml").is_file() or (directory / ".ruff.toml").is_file():
+            return True
+        pyproject = directory / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                content = pyproject.read_text()
+                if "[tool.ruff]" in content:
+                    return True
+            except OSError:
+                pass
+    return False
 
 
 def print_output(stdout, stderr, stdout_to_stderr=False):
@@ -106,8 +129,6 @@ def main():
                             # === IMPORT EXCEPTIONS ===
                             "F401",  # UNUSED IMPORTS - Will be checked in Stop hook on whole directory
                             "PLC0415",  # import-outside-toplevel - sometimes needed for lazy loading
-                            # === PANDAS EXCEPTIONS ===
-                            "PD901",  # df is a perfectly fine variable name in context
                             # === UNICODE EXCEPTIONS ===
                             "RUF001",  # Ambiguous unicode in string - false positives on non-English text
                             "RUF002",  # Ambiguous unicode in docstring - false positives on non-English text
@@ -124,20 +145,44 @@ def main():
             print("Ruff not found. Please install ruff.", file=sys.stderr)
             sys.exit(HOOK_WARN)
 
-        # Handle ruff exit codes
+        # Handle ruff check exit codes
         if check_result.returncode == RUFF_SUCCESS:
             # Success - no violations found
             print_output(check_result.stdout, check_result.stderr)
-            sys.exit(HOOK_SUCCESS)
+            exit_code = HOOK_SUCCESS
         elif check_result.returncode == RUFF_VIOLATIONS:
             # Violations found - block Claude and show errors
             print_output(check_result.stdout, check_result.stderr, stdout_to_stderr=True)
-            sys.exit(HOOK_BLOCK)
-        elif check_result.returncode == RUFF_ERROR:
+            exit_code = HOOK_BLOCK
+        else:
             # Config/internal error - warn but don't block
             print(f"Ruff error (exit code {check_result.returncode})", file=sys.stderr)
             print_output(check_result.stdout, check_result.stderr)
-            sys.exit(HOOK_WARN)
+            exit_code = HOOK_WARN
+
+        # Format check: report drift without rewriting the file. Uses --check
+        # so it never modifies the file, only warns when it would.
+        format_cmd = ["ruff", "format", "--check"]
+        if not has_ruff_config(file_path):
+            format_cmd += ["--line-length", "120"]
+        format_cmd.append(file_path)
+
+        format_result = subprocess.run(
+            format_cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if format_result.returncode == RUFF_FORMAT_WOULD_REFORMAT:
+            print("Ruff format: file is not formatted. Run `ruff format` to fix:", file=sys.stderr)
+            print_output(format_result.stdout, format_result.stderr, stdout_to_stderr=True)
+            exit_code = max(exit_code, HOOK_WARN)
+        elif format_result.returncode not in (RUFF_FORMAT_OK, RUFF_FORMAT_WOULD_REFORMAT):
+            print(f"Ruff format error (exit code {format_result.returncode})", file=sys.stderr)
+            print_output(format_result.stdout, format_result.stderr, stdout_to_stderr=True)
+            exit_code = max(exit_code, HOOK_WARN)
+
+        sys.exit(exit_code)
 
     except Exception as e:
         print(f"Hook error: {e}", file=sys.stderr)
