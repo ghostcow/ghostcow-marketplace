@@ -11,7 +11,7 @@
     {
       "name": "ruff-hooks",
       "source": "./plugins/ruff-hooks",
-      "description": "Runs ruff check and format on Python files after every Write, Edit, or MultiEdit"
+      "description": "Runs ruff check and format --check on Python files after every Write, Edit, or MultiEdit, without modifying them"
     },
     {
       "name": "catline-status",
