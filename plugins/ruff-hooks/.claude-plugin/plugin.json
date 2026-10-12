@@ -1,7 +1,7 @@
 {
   "name": "ruff-hooks",
-  "version": "1.1.0",
-  "description": "Runs ruff check (with auto-fix) on Python files after every Write, Edit, or MultiEdit, and warns if the file isn't formatted (without rewriting it). Blocks Claude on unfixable linting violations. Merges with your project's ruff config if present, falls back to opinionated defaults otherwise.",
+  "version": "1.2.0",
+  "description": "Runs ruff check and ruff format --check on Python files after every Write, Edit, or MultiEdit, without modifying the file. Reports linting violations to Claude and warns if the file isn't formatted. Merges with your project's ruff config if present, falls back to opinionated defaults otherwise.",
   "author": {
     "name": "Airis"
   },

@@ -1,6 +1,6 @@
 # Ruff Hooks Plugin
 
-Automatic Python linting and formatting with [Ruff](https://github.com/astral-sh/ruff) on file edits.
+Automatic Python lint and format checks with [Ruff](https://github.com/astral-sh/ruff) on file edits.
 
 ## Requirements
 
@@ -16,9 +16,9 @@ uv pip install ruff
 
 This plugin adds a PostToolUse hook that runs automatically after `Write`, `Edit`, or `MultiEdit` operations on Python files:
 
-### 1. Ruff Check (with auto-fix)
+### 1. Ruff Check (report-only)
 
-Runs comprehensive linting with auto-fix enabled. Blocks Claude if unfixable violations are found.
+Runs comprehensive linting without `--fix`, so the file is never modified. Reports violations to Claude so it can fix them.
 
 **Enabled rules:**
 - **Core**: Pyflakes (F), critical pycodestyle (E4, E7, E9), isort (I)
@@ -59,6 +59,6 @@ ignore = ["PT"]  # Suppresses pytest rules added by the plugin
 ## Behavior
 
 - **Python files only**: The hook skips non-Python files silently
-- **Auto-fix**: Linting violations are fixed automatically where possible
-- **Blocking**: Unfixable linting errors block Claude until resolved
-- **Non-blocking**: An unformatted file, format-check errors, and a missing Ruff installation only warn — none of them rewrite the file
+- **Read-only**: The hook never rewrites the file
+- **Lint violations**: Reported to Claude (exit code 2) so it fixes them
+- **Non-blocking**: An unformatted file, format-check errors, and a missing Ruff installation only warn

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 PostToolUse hook for checking and format-checking Python files after editing.
-This hook runs after Edit, Write, or MultiEdit operations, applies ruff linting
-(with auto-fix), and warns (without modifying the file) if it is not formatted.
+This hook runs after Edit, Write, or MultiEdit operations, reports ruff lint
+violations, and warns if the file is not formatted. It never modifies the file.
 NOTE: Excludes import checks (F401) which are handled by the Stop hook.
 """
 
@@ -74,7 +74,6 @@ def main():
                 [
                     "ruff",
                     "check",
-                    "--fix",
                     "--extend-select",
                     # Combine all selected rules into a single comma-separated string
                     ",".join(
