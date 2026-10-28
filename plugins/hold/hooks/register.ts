@@ -37,6 +37,15 @@ const withoutBatch = (s: Hold, key: string): Hold => {
 /** Ends holding for one batch: its agents' later messages pass through. */
 const stopHolding = (b: Batch): Batch => ({ ...b, isHolding: false, held: [] })
 
+/**
+ * Drops batches that hold nothing and take no more agents. An open batch that
+ * stopped holding stays, so agents its turn launches later are not held.
+ */
+const pruned = (s: Hold): Hold => ({
+  ...s,
+  batches: Object.fromEntries(Object.entries(s.batches).filter(([, b]) => b.isHolding || b.isOpen)),
+})
+
 const showStatus = async ($: EngineInterface) => {
   const s = await read($, hold)
   const holding = Object.values(s.batches).filter(b => b.isHolding && b.members.length > 0)
@@ -135,7 +144,7 @@ const settle = async ($: EngineInterface) => {
       }
     }
 
-    return { ...s, batches }
+    return pruned({ ...s, batches })
   })
 
   release($, released)
@@ -212,7 +221,7 @@ export const register: Register = on => {
           }
 
           released = b.held
-          return withBatch(s, key, stopHolding(b))
+          return pruned(withBatch(s, key, stopHolding(b)))
         })
         release($, released)
         await showStatus($)
@@ -242,14 +251,14 @@ export const register: Register = on => {
       const b = state.batches[turnId]
 
       if (b === undefined) {
-        return state
+        return pruned(state)
       }
 
       if (!b.isHolding || b.members.length === 0) {
-        return withoutBatch(state, turnId)
+        return pruned(withoutBatch(state, turnId))
       }
 
-      return withBatch(state, turnId, { ...b, isOpen: false })
+      return pruned(withBatch(state, turnId, { ...b, isOpen: false }))
     })
 
     const result = await next(e)
@@ -289,13 +298,13 @@ export const register: Register = on => {
     await update($, hold, s => {
       const held = Object.values(s.batches).flatMap(b => (b.isHolding ? b.held : []))
       released = [...s.pending, ...held]
-      return {
+      return pruned({
         ...s,
         pending: [],
         batches: Object.fromEntries(
           Object.entries(s.batches).map(([key, b]) => [key, b.isHolding ? stopHolding(b) : b]),
         ),
-      }
+      })
     })
     await showStatus($)
 
