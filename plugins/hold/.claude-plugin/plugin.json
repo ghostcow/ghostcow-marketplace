@@ -1,0 +1,9 @@
+{
+  "name": "hold",
+  "version": "0.1.0",
+  "description": "Holds background-agent completion messages from one turn and sends them to Claude together when all finish.",
+  "author": {
+    "name": "ghostcow"
+  },
+  "types": "./types/index.d.ts"
+}
