@@ -13,6 +13,7 @@ Then install individual plugins:
 ```
 /plugin install catline-status@ghostcow-marketplace
 /plugin install research-assistant@ghostcow-marketplace
+/plugin install hold@ghostcow-marketplace
 ```
 
 ## Plugins
@@ -21,3 +22,4 @@ Then install individual plugins:
 |--------|-------------|
 | **catline-status** | Claude Code statusline showing model, working directory, git branch, and remaining context — with rotating cat face animations. |
 | **research-assistant** | Academic research assistant powered by Semantic Scholar. Search papers, explore citation networks, and synthesize findings. |
+| **hold** | Holds the completion messages of background agents launched in one turn, then sends them to Claude together when all have finished cleanly. The status line shows `holding N/M`. |
