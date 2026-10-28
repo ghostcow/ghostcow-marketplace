@@ -8,6 +8,8 @@ A batch is the set of background agents that the main session launches during on
 
 The mod holds two kinds of message from a batch's agents: the agent's hand-back message and its task notification.
 
+Claude Code delivers some task notifications as attachments to the next turn instead of as messages. The mod cannot hold those. They reach Claude in the turn that follows, which is usually the release turn.
+
 These agents are excluded from batches, and their messages pass through unchanged:
 
 - forks
