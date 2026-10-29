@@ -293,7 +293,9 @@ export const register: Register = on => {
 
     release($, released)
     await showStatus($)
-    return { text: isOff ? 'hold off' : 'hold on' }
+    // A toast leaves the transcript and the model untouched.
+    $.ui.toast(isOff ? 'hold off' : 'hold on')
+    return {}
   })
 
   on('prompt.submit', async ($, e, next) => {

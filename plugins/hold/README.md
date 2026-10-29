@@ -35,7 +35,7 @@ The mod reads agent status every 2 seconds, because agent status changes raise n
 
 ## Switching it off
 
-`/hold` switches holding off or back on for the rest of the session. Switching it off sends everything held to Claude at once, and the agents launched afterwards pass through. Switching it back on holds the batches of turns that start afterwards.
+`/hold` switches holding off or back on for the rest of the session. A toast shows the new state; nothing is added to the transcript. Switching it off sends everything held to Claude at once, and the agents launched afterwards pass through. Switching it back on holds the batches of turns that start afterwards.
 
 ## Status line
 
