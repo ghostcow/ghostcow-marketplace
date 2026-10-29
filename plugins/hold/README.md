@@ -33,6 +33,10 @@ After a release, that batch's later messages pass through unchanged. Slash comma
 
 The mod reads agent status every 2 seconds, because agent status changes raise no event a mod sees. An agent that Claude Code no longer lists counts as finished.
 
+## Switching it off
+
+`/hold` switches holding off or back on for the rest of the session. Switching it off sends everything held to Claude at once, and the agents launched afterwards pass through. Switching it back on holds the batches of turns that start afterwards.
+
 ## Status line
 
 While a batch holds messages, the status line shows `holding N/M`: N agents have finished out of M in holding batches. While messages wait for the user's next message, it shows `N held`.
