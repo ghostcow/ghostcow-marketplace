@@ -156,6 +156,7 @@ const settle = async ($: EngineInterface) => {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    await $.command.register({ name: 'hold', description: 'Switch holding of agent results on or off' })
     await showStatus($)
     // Agent status changes raise no event a mod sees, so holding batches are
     // checked on a timer.
@@ -185,7 +186,7 @@ export const register: Register = on => {
     if (isBatched && result.agentId !== undefined) {
       const agentId = result.agentId
       await update($, hold, s => {
-        if (s.mainTurnId === null) {
+        if (s.mainTurnId === null || s.isOff === true) {
           return s
         }
 
@@ -264,6 +265,35 @@ export const register: Register = on => {
     const result = await next(e)
     await settle($)
     return result
+  })
+
+  // Switching off releases everything held now; switching on holds the
+  // batches of turns that start afterwards.
+  on('command.run', { command: 'hold' }, async $ => {
+    let released: string[] = []
+    let isOff = false
+
+    await update($, hold, s => {
+      isOff = s.isOff !== true
+      released = []
+
+      if (!isOff) {
+        return { ...s, isOff }
+      }
+
+      const held = Object.values(s.batches).flatMap(b => (b.isHolding ? b.held : []))
+      released = [...s.pending, ...held]
+      return pruned({
+        ...s,
+        isOff,
+        pending: [],
+        batches: Object.fromEntries(Object.entries(s.batches).map(([key, b]) => [key, stopHolding(b)])),
+      })
+    })
+
+    release($, released)
+    await showStatus($)
+    return { text: isOff ? 'hold off' : 'hold on' }
   })
 
   on('prompt.submit', async ($, e, next) => {
