@@ -3,9 +3,14 @@
 import asyncio
 import io
 import json
-import os
+import subprocess
+import sys
+import textwrap
 import time
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -15,29 +20,40 @@ from s2 import (
     AUTHOR_SCAN_FIELDS,
     DETAIL_FIELDS,
     FIELDS_HELP,
-    RETRY_EXCEPTIONS,
-    RETRY_WAIT,
+    RETRY_ATTEMPTS,
     SCAN_FIELDS,
+    RateLimitedError,
+    S2Client,
     S2Requester,
     _describe_error,
+    _fetch,
+    _parse_retry_after,
     cmd_author_papers,
     cmd_citations,
     cmd_fields,
     cmd_get,
+    cmd_read,
     cmd_recommend,
     cmd_references,
     cmd_search,
     cmd_search_author,
+    fetch_full_text,
+    find_figures,
+    html_to_text,
+    mark_captions,
     main,
     make_client,
     output,
+    pdf_to_text,
     read_ids,
 )
 from semanticscholar.SemanticScholarException import (
+    BadQueryParametersException,
     InternalServerErrorException,
     ObjectNotFoundException,
+    ServerErrorException,
 )
-from tenacity import RetryError, stop_after_attempt
+from tenacity import RetryError
 
 # ---------------------------------------------------------------------------
 # read_ids
@@ -112,10 +128,16 @@ class TestMakeClient:
         assert client.auth_header == {"x-api-key": "test-key"}
 
     @patch.dict("os.environ", {}, clear=True)
-    def test_without_api_key(self):
+    def test_without_api_key(self, capsys):
         with patch("s2.Path.read_text", side_effect=FileNotFoundError):
             client = make_client()
         assert client.auth_header == {}
+        assert "/research-assistant:setup" in capsys.readouterr().err
+
+    @patch.dict("os.environ", {"S2_API_KEY": "test-key"}, clear=False)
+    def test_with_api_key_no_warning(self, capsys):
+        make_client()
+        assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +227,18 @@ class TestCmdGet:
 
         stderr = capsys.readouterr().err
         assert "error: not found: bad_id_1, bad_id_2" in stderr
+
+    @pytest.mark.asyncio
+    async def test_unknown_status_reported(self, mock_client, capsys):
+        mock_client.get_papers.return_value = ([make_paper({"paperId": "p1"})], None)
+
+        await cmd_get(make_args(ids=["DOI:10.1/x", "PMID:123"]))
+
+        captured = capsys.readouterr()
+        assert json.loads(captured.out.strip())["paperId"] == "p1"
+        assert "error: status unknown" in captured.err
+        assert "DOI:10.1/x, PMID:123" in captured.err
+        assert "not found" not in captured.err
 
     @pytest.mark.asyncio
     async def test_no_warning_when_all_found(self, mock_client, capsys):
@@ -320,6 +354,107 @@ class TestCmdCitations:
         assert json.loads(lines[0])["sourcePaperId"] == "p1"
         assert json.loads(lines[1])["sourcePaperId"] == "p2"
 
+    @pytest.mark.asyncio
+    async def test_year_forwarded_as_date_filter(self, mock_client):
+        mock_client.get_paper_citations.return_value = async_iter([])
+
+        await cmd_citations(make_args(ids=["p1"], limit=10, year="2026"))
+
+        mock_client.get_paper_citations.assert_called_once_with(
+            "p1", fields=SCAN_FIELDS, limit=10, publication_date_or_year="2026"
+        )
+
+    @pytest.mark.asyncio
+    async def test_year_range_uses_colon_separator(self, mock_client):
+        mock_client.get_paper_citations.return_value = async_iter([])
+
+        await cmd_citations(make_args(ids=["p1"], limit=10, year="2018-2020"))
+
+        mock_client.get_paper_citations.assert_called_once_with(
+            "p1", fields=SCAN_FIELDS, limit=10, publication_date_or_year="2018:2020"
+        )
+
+
+class TestS2ClientCitations:
+    @pytest.mark.asyncio
+    async def test_date_filter_sent_on_every_page(self):
+        client = S2Client(api_key=None)
+        pages = [
+            {"offset": 0, "next": 2, "data": [{"citingPaper": {"paperId": "c1"}}, {"citingPaper": {"paperId": "c2"}}]},
+            {"offset": 2, "data": [{"citingPaper": {"paperId": "c3"}}]},
+        ]
+        client._requester.get_data_async = AsyncMock(side_effect=pages)
+
+        results = await client.get_paper_citations(
+            "p1", fields=["title"], limit=2, publication_date_or_year="2026"
+        )
+        ids = [item.paper.paperId async for item in results]
+
+        assert ids == ["c1", "c2", "c3"]
+        calls = client._requester.get_data_async.call_args_list
+        assert len(calls) == 2
+        for call in calls:
+            url, params = call.args[0], call.args[1]
+            assert url.endswith("/graph/v1/paper/p1/citations")
+            assert "publicationDateOrYear=2026" in params
+
+    @pytest.mark.asyncio
+    async def test_no_filter_omits_parameter(self):
+        client = S2Client(api_key=None)
+        client._requester.get_data_async = AsyncMock(return_value={"offset": 0, "data": []})
+
+        await client.get_paper_citations("p1", fields=["title"], limit=5)
+
+        params = client._requester.get_data_async.call_args.args[1]
+        assert "publicationDateOrYear" not in params
+
+
+class TestS2ClientGetPapers:
+    @pytest.mark.asyncio
+    async def test_prefixed_ids_found_by_position(self):
+        # The response has no externalIds, so ID matching cannot confirm these.
+        client = S2Client(api_key=None)
+        ids = ["DOI:10.1/x", "PMID:123", "URL:https://arxiv.org/abs/1706.03762", "CorpusId:42"]
+        client._requester.get_data_async = AsyncMock(return_value=[{"paperId": f"p{i}"} for i in range(4)])
+
+        papers, not_found = await client.get_papers(ids, fields=["title"], return_not_found=True)
+
+        assert [p.paperId for p in papers] == ["p0", "p1", "p2", "p3"]
+        assert not_found == []
+
+    @pytest.mark.asyncio
+    async def test_null_entries_are_not_found(self):
+        client = S2Client(api_key=None)
+        client._requester.get_data_async = AsyncMock(return_value=[{"paperId": "p0"}, None, None])
+
+        papers, not_found = await client.get_papers(["DOI:a", "DOI:b", "ArXiv:c"], fields=["title"], return_not_found=True)
+
+        assert [p.paperId for p in papers] == ["p0"]
+        assert not_found == ["DOI:b", "ArXiv:c"]
+
+    @pytest.mark.asyncio
+    async def test_length_mismatch_gives_unknown(self):
+        client = S2Client(api_key=None)
+        client._requester.get_data_async = AsyncMock(return_value=[{"paperId": "p0"}])
+
+        papers, not_found = await client.get_papers(["DOI:a", "DOI:b"], fields=["title"], return_not_found=True)
+
+        assert [p.paperId for p in papers] == ["p0"]
+        assert not_found is None
+
+    @pytest.mark.asyncio
+    async def test_batch_request_shape(self):
+        client = S2Client(api_key=None)
+        client._requester.get_data_async = AsyncMock(return_value=[{"paperId": "p0"}])
+
+        papers = await client.get_papers(["p0"], fields=["title", "year"])
+
+        url, params, _headers, payload = client._requester.get_data_async.call_args.args
+        assert url.endswith("/graph/v1/paper/batch")
+        assert params == "&fields=title,year"
+        assert payload == {"ids": ["p0"]}
+        assert [p.paperId for p in papers] == ["p0"]
+
 
 # ---------------------------------------------------------------------------
 # cmd_references
@@ -410,6 +545,45 @@ class TestCmdRecommend:
             await cmd_recommend(make_args(ids=None, limit=10))
         assert exc_info.value.code == 0
 
+    @pytest.mark.asyncio
+    async def test_empty_recent_pool_warns_with_pool_hint(self, mock_client, capsys):
+        mock_client.get_recommended_papers.return_value = []
+
+        await cmd_recommend(make_args(ids=["ArXiv:1706.03762"], limit=5))
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no recommendations returned for ArXiv:1706.03762 from the recent pool" in captured.err
+        assert "--pool all-cs" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_empty_all_cs_pool_warns_without_pool_hint(self, mock_client, capsys):
+        mock_client.get_recommended_papers.return_value = []
+
+        await cmd_recommend(make_args(ids=["seed1"], limit=5, pool="all-cs"))
+
+        err = capsys.readouterr().err
+        assert "no recommendations returned for seed1; try different seeds" in err
+        assert "--pool all-cs" not in err
+
+    @pytest.mark.asyncio
+    async def test_empty_list_based_warns_with_all_seeds(self, mock_client, capsys):
+        mock_client.get_recommended_papers_from_lists.return_value = []
+
+        await cmd_recommend(make_args(ids=["s1", "s2"], limit=5))
+
+        err = capsys.readouterr().err
+        assert "no recommendations returned for s1, s2; try different seeds" in err
+        assert "pool" not in err
+
+    @pytest.mark.asyncio
+    async def test_nonempty_result_prints_no_warning(self, mock_client, capsys):
+        mock_client.get_recommended_papers.return_value = [make_paper({"paperId": "rec1"})]
+
+        await cmd_recommend(make_args(ids=["seed1"], limit=5))
+
+        assert capsys.readouterr().err == ""
+
 
 # ---------------------------------------------------------------------------
 # cmd_fields
@@ -428,155 +602,250 @@ class TestCmdFields:
 # ---------------------------------------------------------------------------
 
 
+def _response(status, body=None, headers=None):
+    """Build an httpx.Response as the S2 API would return it."""
+    return httpx.Response(
+        status, json={} if body is None else body, headers=headers, request=httpx.Request("GET", "http://test")
+    )
+
+
+@pytest.fixture
+def http():
+    """Patch httpx.AsyncClient.request; set return_value or side_effect to script the server."""
+    with patch("s2.httpx.AsyncClient.request", new_callable=AsyncMock) as mock:
+        mock.return_value = _response(200, {"data": "ok"})
+        yield mock
+
+
+@pytest.fixture
+def unthrottled():
+    """Patch out the file lock and timestamp file; yields the AsyncFileLock and touch mocks."""
+    with (
+        patch("s2.AsyncFileLock", return_value=AsyncMock()) as lock,
+        patch("s2.os.path.getmtime", return_value=0.0),
+        patch("s2.Path.touch") as touch,
+    ):
+        yield SimpleNamespace(lock=lock, touch=touch)
+
+
+@pytest.fixture
+def mock_sleep():
+    """Patch asyncio.sleep, which both the throttle and the retry backoff call."""
+    with patch("s2.asyncio.sleep", new_callable=AsyncMock) as mock:
+        yield mock
+
+
 class TestS2Requester:
-    @staticmethod
-    def _make_requester(retry):
-        """Create an S2Requester with a mocked _get_data_async."""
-        requester = S2Requester(timeout=10, retry=retry)
-        mock_retrying = AsyncMock(return_value={"data": "test"})
-        requester._get_data_async = MagicMock()
-        requester._get_data_async.retry_with.return_value = mock_retrying
-        return requester
-
     @pytest.mark.asyncio
-    async def test_throttles_requests(self):
-        requester = self._make_requester(retry=False)
-
+    async def test_throttles_requests(self, http, mock_sleep):
         with (
             patch("s2.AsyncFileLock", return_value=AsyncMock()),
             patch("s2.os.path.getmtime", return_value=time.time() - 0.3),
             patch("s2.Path.touch"),
-            patch("s2.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
-            await requester.get_data_async("http://test", {}, {})
-            mock_sleep.assert_called_once()
-            delay = mock_sleep.call_args[0][0]
-            assert 0.0 < delay <= 1.1
+            await S2Requester(timeout=10, retry=False).get_data_async("http://test", "", {})
+        mock_sleep.assert_called_once()
+        delay = mock_sleep.call_args[0][0]
+        assert 0.0 < delay <= 1.1
 
     @pytest.mark.asyncio
-    async def test_no_sleep_when_enough_time_passed(self):
-        requester = self._make_requester(retry=False)
-
-        with (
-            patch("s2.AsyncFileLock", return_value=AsyncMock()),
-            patch("s2.os.path.getmtime", return_value=time.time() - 2.0),
-            patch("s2.Path.touch"),
-            patch("s2.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
-        ):
-            await requester.get_data_async("http://test", {}, {})
-            mock_sleep.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_retry_true_uses_exponential_wait(self):
-        requester = self._make_requester(retry=True)
-
+    async def test_no_sleep_when_enough_time_passed(self, http, mock_sleep):
         with (
             patch("s2.AsyncFileLock", return_value=AsyncMock()),
             patch("s2.os.path.getmtime", return_value=time.time() - 2.0),
             patch("s2.Path.touch"),
         ):
-            await requester.get_data_async("http://test", {}, {})
-
-        call_kwargs = requester._get_data_async.retry_with.call_args[1]
-        assert call_kwargs["retry"] is RETRY_EXCEPTIONS
-        assert call_kwargs["wait"] is RETRY_WAIT
-        assert isinstance(call_kwargs["stop"], stop_after_attempt)
-        assert call_kwargs["stop"].max_attempt_number == 4
+            await S2Requester(timeout=10, retry=False).get_data_async("http://test", "", {})
+        mock_sleep.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_retry_false_uses_stop_after_attempt(self):
-        requester = self._make_requester(retry=False)
-
-        with (
-            patch("s2.AsyncFileLock", return_value=AsyncMock()),
-            patch("s2.os.path.getmtime", return_value=time.time() - 2.0),
-            patch("s2.Path.touch"),
-        ):
-            await requester.get_data_async("http://test", {}, {})
-
-        call_kwargs = requester._get_data_async.retry_with.call_args[1]
-        assert isinstance(call_kwargs["stop"], stop_after_attempt)
-        assert call_kwargs["stop"].max_attempt_number == 1
+    async def test_timestamp_marked_after_response(self, http, unthrottled):
+        """The rate timestamp records when the response arrived, not when the request left."""
+        order = []
+        http.side_effect = lambda *a, **kw: order.append("request") or _response(200)
+        unthrottled.touch.side_effect = lambda: order.append("touch")
+        await S2Requester(timeout=10, retry=False).get_data_async("http://test", "", {})
+        assert order == ["request", "touch"]
 
     @pytest.mark.asyncio
-    async def test_concurrent_requests_are_serialized(self, tmp_path):
-        """asyncio.gather through the real file lock spaces requests ~1.1s apart."""
-        lock_file = str(tmp_path / "s2_rate.lock")
-        ts_file = str(tmp_path / "s2_rate.ts")
-        timestamps = []
-
-        requester = self._make_requester(retry=False)
-        real_get = requester.get_data_async
-
-        async def recording_get(*a, **kw):
-            result = await real_get(*a, **kw)
-            timestamps.append(time.monotonic())
-            return result
-
-        with patch("s2._RATE_LOCK", lock_file), patch("s2._RATE_TS", ts_file):
-            await asyncio.gather(*[recording_get("http://test", {}, {}) for _ in range(3)])
-
-        assert len(timestamps) == 3
-        for i in range(1, len(timestamps)):
-            gap = timestamps[i] - timestamps[i - 1]
-            assert gap >= 1.0, f"gap between request {i - 1} and {i} was {gap:.3f}s, expected >= 1.0s"
+    async def test_timestamp_marked_when_request_fails(self, http, unthrottled):
+        http.side_effect = httpx.ConnectTimeout("timed out")
+        with pytest.raises(httpx.ConnectTimeout):
+            await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        unthrottled.touch.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_server_error_retried(self):
-        """InternalServerErrorException is retried and succeeds on second attempt."""
-        requester = S2Requester(timeout=10, retry=True)
-        call_count = 0
+    async def test_api_key_added_when_headers_missing(self, http, unthrottled):
+        """Paginated SDK calls pass headers=None; the requester still sends the key."""
+        requester = S2Requester(timeout=10, retry=False, auth_header={"x-api-key": "k"})
+        await requester.get_data_async("http://test", "", None)
+        assert http.call_args.kwargs["headers"] == {"x-api-key": "k"}
 
-        async def flaky(*args, **kwargs):  # noqa: ARG001
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise InternalServerErrorException("500 Internal Server Error")
-            return {"data": "ok"}
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("call", "body"),
+        [
+            (lambda c: c.get_paper_citations("p1", limit=5), {"data": []}),
+            (lambda c: c.get_paper_references("p1", limit=5), {"data": []}),
+            (lambda c: c.get_author_papers("a1", limit=5), {"data": []}),
+            (lambda c: c.search_paper("q", limit=5), {"data": []}),
+            (lambda c: c.get_papers(["p1"]), []),
+            (lambda c: c.get_recommended_papers("p1"), {"recommendedPapers": []}),
+        ],
+        ids=["citations", "references", "author-papers", "search", "batch", "recommend"],
+    )
+    async def test_client_sends_api_key_on_every_endpoint(self, http, unthrottled, call, body):
+        http.return_value = _response(200, body)
+        await call(S2Client(api_key="k"))
+        assert http.call_args.kwargs["headers"]["x-api-key"] == "k"
 
-        with (
-            patch("s2.AsyncFileLock", return_value=AsyncMock()),
-            patch("s2.os.path.getmtime", return_value=0.0),
-            patch("s2.Path.touch"),
-            patch.object(type(requester), "_get_data_async", create=True),
-        ):
-            # Replace the real tenacity-wrapped method with our flaky function,
-            # configured with the same retry settings used in production.
-            from tenacity import retry
-
-            requester._get_data_async = retry(
-                retry=RETRY_EXCEPTIONS,
-                wait=RETRY_WAIT,
-                stop=stop_after_attempt(4),
-            )(flaky)
-            result = await requester.get_data_async("http://test", {}, {})
-
-        assert call_count == 2
+    @pytest.mark.asyncio
+    async def test_rate_limited_retries_go_through_throttle(self, http, unthrottled, mock_sleep):
+        http.side_effect = [_response(429), _response(429), _response(200, {"data": "ok"})]
+        result = await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
         assert result == {"data": "ok"}
+        assert unthrottled.lock.call_count == 3
+        assert unthrottled.touch.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_server_error_exhausted(self):
-        """InternalServerErrorException raised 4 times → RetryError."""
-        requester = S2Requester(timeout=10, retry=True)
+    async def test_retry_after_header_sets_wait(self, http, unthrottled, mock_sleep):
+        http.side_effect = [_response(429, headers={"Retry-After": "7"}), _response(200)]
+        await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        mock_sleep.assert_called_once_with(7.0)
 
-        async def always_500(*args, **kwargs):  # noqa: ARG001
-            raise InternalServerErrorException("500 Internal Server Error")
+    @pytest.mark.asyncio
+    async def test_backoff_without_retry_after_has_jitter(self, http, unthrottled, mock_sleep):
+        http.side_effect = [_response(429), _response(200)]
+        await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        delay = mock_sleep.call_args[0][0]
+        assert 1.0 <= delay <= 2.0
 
+    @pytest.mark.asyncio
+    async def test_rate_limited_exhausted(self, http, unthrottled, mock_sleep):
+        http.return_value = _response(429)
+        with pytest.raises(RetryError) as exc_info:
+            await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        assert isinstance(exc_info.value.last_attempt.exception(), RateLimitedError)
+        assert http.await_count == RETRY_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_retry_false_makes_one_attempt(self, http, unthrottled, mock_sleep):
+        http.return_value = _response(429)
+        with pytest.raises(RetryError):
+            await S2Requester(timeout=10, retry=False).get_data_async("http://test", "", {})
+        assert http.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_server_error_retried(self, http, unthrottled, mock_sleep):
+        http.side_effect = [_response(500, {"message": "boom"}), _response(200, {"data": "ok"})]
+        result = await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        assert result == {"data": "ok"}
+        assert http.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_server_error_exhausted(self, http, unthrottled, mock_sleep):
+        http.return_value = _response(503)
+        with pytest.raises(RetryError) as exc_info:
+            await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        assert isinstance(exc_info.value.last_attempt.exception(), ServerErrorException)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "exc_type"),
+        [(400, BadQueryParametersException), (403, PermissionError), (404, ObjectNotFoundException)],
+    )
+    async def test_client_errors_not_retried(self, http, unthrottled, status, exc_type):
+        http.return_value = _response(status, {"error": "bad"})
+        with pytest.raises(exc_type):
+            await S2Requester(timeout=10, retry=True).get_data_async("http://test", "", {})
+        assert http.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_error_only_body_returns_empty(self, http, unthrottled):
+        http.return_value = _response(200, {"error": "no match"})
+        assert await S2Requester(timeout=10, retry=False).get_data_async("http://test", "", {}) == {}
+
+    @pytest.mark.asyncio
+    async def test_payload_sent_as_post(self, http, unthrottled):
+        await S2Requester(timeout=10, retry=False).get_data_async("http://test", "&fields=title", {}, {"ids": ["p1"]})
+        args, kwargs = http.call_args
+        assert args[0] == "POST"
+        assert kwargs["params"] == "fields=title"
+        assert kwargs["json"] == {"ids": ["p1"]}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_are_serialized(self, tmp_path, http):
+        """asyncio.gather through the real file lock: each request starts _RATE_INTERVAL after the previous response."""
+        spans = []
+
+        async def slow_server(*a, **kw):
+            start = time.time()
+            await asyncio.sleep(0.05)
+            spans.append((start, time.time()))
+            return _response(200)
+
+        http.side_effect = slow_server
+        requester = S2Requester(timeout=10, retry=False)
         with (
-            patch("s2.AsyncFileLock", return_value=AsyncMock()),
-            patch("s2.os.path.getmtime", return_value=0.0),
-            patch("s2.Path.touch"),
-            patch.object(type(requester), "_get_data_async", create=True),
+            patch("s2._RATE_LOCK", str(tmp_path / "s2_rate.lock")),
+            patch("s2._RATE_TS", str(tmp_path / "s2_rate.ts")),
+            patch("s2._RATE_INTERVAL", 0.3),
         ):
-            from tenacity import retry
+            await asyncio.gather(*[requester.get_data_async("http://test", "", {}) for _ in range(3)])
 
-            requester._get_data_async = retry(
-                retry=RETRY_EXCEPTIONS,
-                wait=RETRY_WAIT,
-                stop=stop_after_attempt(4),
-            )(always_500)
-            with pytest.raises(RetryError):
-                await requester.get_data_async("http://test", {}, {})
+        spans.sort()
+        assert len(spans) == 3
+        for (_, prev_end), (start, _) in zip(spans, spans[1:]):
+            assert start - prev_end >= 0.29, f"request started {start - prev_end:.3f}s after the previous response"
+
+    def test_processes_are_serialized(self, tmp_path):
+        """Three s2 processes sharing the lock never overlap and keep _RATE_INTERVAL between requests."""
+        child = textwrap.dedent(
+            """
+            import asyncio, json, sys, time
+            from unittest.mock import patch
+            sys.path.insert(0, sys.argv[1])
+            import httpx, s2
+            s2._RATE_LOCK, s2._RATE_TS, s2._RATE_INTERVAL = sys.argv[2], sys.argv[3], 0.3
+
+            async def slow_server(self, method, url, **kw):
+                start = time.time()
+                await asyncio.sleep(0.05)
+                print(json.dumps([start, time.time()]), flush=True)
+                return httpx.Response(200, json={}, request=httpx.Request(method, url))
+
+            async def main():
+                with patch.object(httpx.AsyncClient, "request", slow_server):
+                    for _ in range(2):
+                        await s2.S2Requester(10, False).get_data_async("http://test", "", {})
+
+            asyncio.run(main())
+            """
+        )
+        scripts = str(Path(__file__).resolve().parent.parent / "scripts")
+        argv = [sys.executable, "-c", child, scripts, str(tmp_path / "s2_rate.lock"), str(tmp_path / "s2_rate.ts")]
+        procs = [subprocess.Popen(argv, stdout=subprocess.PIPE, text=True) for _ in range(3)]
+        spans = sorted(json.loads(line) for p in procs for line in p.communicate(timeout=30)[0].splitlines())
+
+        assert len(spans) == 6
+        for (_, prev_end), (start, _) in zip(spans, spans[1:]):
+            assert start - prev_end >= 0.29, f"request started {start - prev_end:.3f}s after the previous response"
+
+
+class TestParseRetryAfter:
+    def test_seconds(self):
+        assert _parse_retry_after("5") == 5.0
+
+    def test_http_date(self):
+        future = format_datetime(datetime.now(UTC) + timedelta(seconds=30), usegmt=True)
+        assert 28.0 <= _parse_retry_after(future) <= 30.0
+
+    def test_past_date_is_zero(self):
+        assert _parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0
+
+    @pytest.mark.parametrize("value", [None, "", "soon"])
+    def test_missing_or_invalid(self, value):
+        assert _parse_retry_after(value) is None
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +1022,38 @@ class TestMainArgparse:
         args = mock_cmd.call_args[0][0]
         assert args.ids == ["id1", "id2"]
         assert args.fields == "title"
+
+    @patch("s2.cmd_citations", new_callable=AsyncMock)
+    def test_citations_parses_year(self, mock_cmd):
+        with patch("sys.argv", ["s2", "citations", "-i", "p1", "-y", "2018-2020"]):
+            main()
+
+        args = mock_cmd.call_args[0][0]
+        assert args.year == "2018-2020"
+
+    @pytest.mark.parametrize("value", ["2026", "2018-2020", "2018-", "-2015"])
+    @pytest.mark.parametrize("command", [["search", "q"], ["citations", "-i", "p1"]])
+    @patch("s2.cmd_citations", new_callable=AsyncMock)
+    @patch("s2.cmd_search", new_callable=AsyncMock)
+    def test_year_accepts_years_and_ranges(self, mock_search, mock_citations, command, value):
+        with patch("sys.argv", ["s2", *command, "-y", value]):
+            main()
+
+        mock_cmd = mock_search if command[0] == "search" else mock_citations
+        assert mock_cmd.call_args[0][0].year == value
+
+    @pytest.mark.parametrize("value", ["2026-06-01", "2026-06", "2020:2021", "26", "2018-2020-2022", "abcd"])
+    @pytest.mark.parametrize("command", [["search", "q"], ["citations", "-i", "p1"]])
+    @patch("s2.cmd_citations", new_callable=AsyncMock)
+    @patch("s2.cmd_search", new_callable=AsyncMock)
+    def test_year_rejects_dates_and_junk(self, mock_search, mock_citations, command, value, capsys):
+        with patch("sys.argv", ["s2", *command, "-y", value]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+        assert exc_info.value.code == 2
+        assert "invalid year or range" in capsys.readouterr().err
+        mock_search.assert_not_called()
+        mock_citations.assert_not_called()
 
     @patch("s2.cmd_fields", new_callable=AsyncMock)
     def test_fields_command(self, mock_cmd):
@@ -1195,3 +1496,354 @@ class TestCmdAuthorPapers:
         await cmd_author_papers(make_args(ids=["auth1"], fields="title,year", limit=5))
 
         mock_client.get_author_papers.assert_called_once_with("auth1", fields=["title", "year"], limit=5)
+
+
+# ---------------------------------------------------------------------------
+# read
+# ---------------------------------------------------------------------------
+
+ARXIV_HTML = """<html><head><title>T</title><script>var x = 1;</script></head><body>
+<nav>Back to arXiv</nav><h5 class="modal-title">Report issue</h5>
+<article class="ltx_document">
+<h1 class="ltx_title ltx_title_document">A Paper</h1>
+<h6 class="ltx_title ltx_title_abstract">Abstract</h6><p>We study <math alttext="k" display="inline"><mi>k</mi></math> things.</p>
+<section><h2 class="ltx_title ltx_title_section"><span class="ltx_tag">1 </span>Introduction</h2>
+<p>Context   collapse is   common.</p></section>
+<button>Copy</button>
+</article></body></html>"""
+
+
+def _transport(routes, calls=None):
+    """httpx MockTransport answering URL -> (status, content); unknown URLs get 404."""
+
+    def handler(request):
+        if calls is not None:
+            calls.append(str(request.url))
+        status, content = routes.get(str(request.url), (404, b""))
+        return httpx.Response(status, content=content)
+
+    return httpx.MockTransport(handler)
+
+
+def _http(routes, calls=None):
+    return lambda: httpx.AsyncClient(transport=_transport(routes, calls))
+
+
+ARXIV_PAPER = {"paperId": "p1", "title": "A Paper", "year": 2026, "citationCount": 3, "externalIds": {"ArXiv": "2604.00001"}}
+
+
+class TestHtmlToText:
+    def test_article_text_sections_and_math(self):
+        text, sections = html_to_text(ARXIV_HTML)
+        assert sections == ["A Paper", "Abstract", "1 Introduction"]
+        assert "# A Paper" in text
+        assert "## 1 Introduction" in text
+        assert "We study k things." in text
+        assert "Context collapse is common." in text
+        for noise in ("Back to arXiv", "Report issue", "var x", "Copy"):
+            assert noise not in text
+
+    def test_page_without_article_uses_whole_body(self):
+        text, sections = html_to_text("<body><h2>Intro</h2><p>Body text</p></body>")
+        assert sections == ["Intro"]
+        assert "Body text" in text
+
+
+class TestPdfToText:
+    def test_extracts_pages_and_heading_lines(self):
+        pages = [SimpleNamespace(extract_text=lambda: "Abstract\nWe do things.\n1 Introduction\nText 2 more."),
+                 SimpleNamespace(extract_text=lambda: "References\n[1] Someone. 2020.")]
+        with patch("s2.PdfReader", return_value=SimpleNamespace(pages=pages)):
+            text, sections = pdf_to_text(b"%PDF-1.7")
+        assert sections == ["Abstract", "1 Introduction", "References"]
+        assert "We do things." in text and "[1] Someone" in text
+
+
+class TestFigures:
+    PAGES = [
+        "1 Introduction\nAs shown in Figure 2, results improve.\nFigure 1 shows the setup.",
+        "Figure 1: Overview of the pipeline.\nIt has three stages.\nTable 1. Main results on four benchmarks.",
+        "Fig. 2. Accuracy versus model size.\nWe see in Figure 1: nothing new.",
+        "Figure 3.5 is a subfigure label, not a caption",
+    ]
+    # Publisher styles: a wrapped mention ("Figure 4.") before the real caption, an all-caps label
+    # alone on its line, and a label followed directly by a capitalized caption.
+    PUBLISHER_PAGES = [
+        "the results are shown in\nFigure 4. Detailed strategies are listed.",
+        "FIGURE 4\nForest plot of effects.\nTABLE 2 Characteristics of studies.",
+        "Figure 5 Flow diagram of the study selection.",
+    ]
+
+    def test_captions_not_mentions(self):
+        figures = find_figures(self.PAGES)
+        assert [(f["label"], f["page"]) for f in figures] == [("Figure 1", 2), ("Table 1", 2), ("Figure 2", 3)]
+        assert figures[0]["caption"].startswith("Figure 1: Overview of the pipeline.")
+        assert len(figures[0]["caption"]) <= 200
+
+    def test_publisher_caption_styles(self):
+        figures = find_figures(self.PUBLISHER_PAGES)
+        assert [(f["label"], f["page"]) for f in figures] == [("Figure 4", 2), ("Table 2", 2), ("Figure 5", 3)]
+
+    def test_mark_captions_best_occurrence_only(self):
+        figures = [{"label": "Figure 1", "caption": "", "page": 4}, {"label": "Table 1", "caption": "", "page": 5}]
+        text = "Intro\nFigure 1. wrapped mention\nFigure 1: Overview.\nTable 1: Results.\nFigure 9: unknown.\n"
+        marked = mark_captions(text, figures)
+        assert "[Figure 1, PDF page 4] Figure 1: Overview." in marked
+        assert "[Table 1, PDF page 5] Table 1: Results." in marked
+        assert "\nFigure 1. wrapped mention" in marked
+        assert "\nFigure 9: unknown." in marked
+        assert mark_captions(marked, figures) == marked
+
+    def test_html_figcaption_gets_marker(self):
+        html = ARXIV_HTML.replace(
+            "<button>", '<figure><img src="x.png"><figcaption>Figure 1: The pipeline.</figcaption></figure><button>'
+        )
+        text, _ = html_to_text(html)
+        marked = mark_captions(text, [{"label": "Figure 1", "caption": "", "page": 3}])
+        assert "[Figure 1, PDF page 3] Figure 1: The pipeline." in marked
+
+
+class TestFetchFullText:
+    @pytest.mark.asyncio
+    async def test_arxiv_html_first(self):
+        routes = {"https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode())}
+        async with _http(routes)() as http:
+            text, sections, source, pdf = await fetch_full_text(http, ARXIV_PAPER)
+        assert source == "arxiv-html"
+        assert "1 Introduction" in sections
+        assert pdf is None
+
+    @pytest.mark.asyncio
+    async def test_arxiv_html_text_and_arxiv_pdf(self):
+        routes = {
+            "https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode()),
+            "https://arxiv.org/pdf/2604.00001": (200, b"%PDF-1.7 body"),
+        }
+        with patch("s2.pdf_to_text") as conv:
+            async with _http(routes)() as http:
+                text, sections, source, pdf = await fetch_full_text(http, ARXIV_PAPER)
+        assert source == "arxiv-html"
+        assert pdf == b"%PDF-1.7 body"
+        conv.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_arxiv_pdf(self):
+        routes = {"https://arxiv.org/pdf/2604.00001": (200, b"%PDF-1.7 body")}
+        with patch("s2.pdf_to_text", return_value=("pdf text\n", [])) as conv:
+            async with _http(routes)() as http:
+                text, sections, source, pdf = await fetch_full_text(http, ARXIV_PAPER)
+        assert (text, sections, source, pdf) == ("pdf text\n", [], "arxiv-pdf", b"%PDF-1.7 body")
+        conv.assert_called_once_with(b"%PDF-1.7 body")
+
+    @pytest.mark.asyncio
+    async def test_html_without_document_falls_back(self):
+        routes = {
+            "https://arxiv.org/html/2604.00001": (200, b"<html>HTML is not available</html>"),
+            "https://arxiv.org/pdf/2604.00001": (200, b"%PDF-1.7"),
+        }
+        with patch("s2.pdf_to_text", return_value=("t\n", [])):
+            async with _http(routes)() as http:
+                assert (await fetch_full_text(http, ARXIV_PAPER))[2] == "arxiv-pdf"
+
+    @pytest.mark.asyncio
+    async def test_open_access_pdf_for_non_arxiv(self):
+        paper = {"paperId": "p2", "openAccessPdf": {"url": "https://example.org/a.pdf"}}
+        routes = {"https://example.org/a.pdf": (200, b"%PDF-1.4")}
+        with patch("s2.pdf_to_text", return_value=("t\n", [])):
+            async with _http(routes)() as http:
+                assert (await fetch_full_text(http, paper))[2] == "open-access-pdf"
+
+    @pytest.mark.asyncio
+    async def test_open_access_landing_page_is_not_a_pdf(self):
+        paper = {"paperId": "p2", "openAccessPdf": {"url": "https://example.org/landing"}}
+        routes = {"https://example.org/landing": (200, b"<html>landing</html>")}
+        async with _http(routes)() as http:
+            assert await fetch_full_text(http, paper) == (None, [], None, None)
+
+    @pytest.mark.asyncio
+    async def test_retries_server_errors(self):
+        answers = iter([503, 429, 200])
+
+        def handler(request):
+            return httpx.Response(next(answers), content=b"%PDF-1.7")
+
+        with patch("s2.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                r = await _fetch(http, "https://example.org/a.pdf")
+        assert r.status_code == 200
+        assert sleep.await_count == 2
+
+
+class TestCmdRead:
+    @pytest.fixture(autouse=True)
+    def _cache(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("S2_CACHE_DIR", str(tmp_path))
+        self.cache = tmp_path
+
+    def _setup(self, mock_client, paper=ARXIV_PAPER, refs=()):
+        mock_client.get_papers.return_value = ([make_paper(paper)], [])
+        mock_client.get_paper_references.return_value = async_iter(list(refs))
+        mock_client.get_paper_citations.return_value = async_iter([])
+
+    @pytest.mark.asyncio
+    async def test_outputs_full_text_path_sections_and_refs(self, mock_client, capsys):
+        refs = [
+            make_citation({"citedPaper": {"paperId": "r1", "title": "Ref", "year": 2020}}),
+            make_citation({"citedPaper": {"paperId": None, "title": "Unresolved", "year": None}}),
+            make_citation({"citedPaper": {}}, has_paper=False),
+        ]
+        self._setup(mock_client, refs=refs)
+        routes = {"https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode())}
+        with patch("s2._http_client", _http(routes)):
+            await cmd_read(make_args(ids=["ArXiv:2604.00001"], refs=50))
+
+        out = json.loads(capsys.readouterr().out)
+        assert out["fullTextSource"] == "arxiv-html"
+        assert Path(out["fullTextPath"]) == self.cache / "p1.txt"
+        assert "Context collapse is common." in Path(out["fullTextPath"]).read_text()
+        assert out["sections"] == ["A Paper", "Abstract", "1 Introduction"]
+        assert out["references"] == [{"paperId": "r1", "title": "Ref", "year": 2020}]
+        assert out["citationCount"] == 3
+        assert out["citationsInRange"] is None
+        assert out["pdfPath"] is None and out["figures"] == []
+        mock_client.get_paper_citations.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_year_counts_citations_in_range(self, mock_client, capsys):
+        self._setup(mock_client)
+        mock_client.get_paper_citations.return_value = async_iter([make_citation({}) for _ in range(4)])
+        with patch("s2._http_client", _http({})):
+            await cmd_read(make_args(ids=["p1"], refs=0, year="2018-2020"))
+
+        out = json.loads(capsys.readouterr().out)
+        assert out["citationsInRange"] == 4
+        mock_client.get_paper_citations.assert_called_once_with(
+            "p1", fields=["paperId"], limit=1000, publication_date_or_year="2018:2020"
+        )
+        mock_client.get_paper_references.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refs_limit(self, mock_client, capsys):
+        refs = [make_citation({"citedPaper": {"paperId": f"r{i}", "title": "t", "year": 2020}}) for i in range(5)]
+        self._setup(mock_client, refs=refs)
+        with patch("s2._http_client", _http({})):
+            await cmd_read(make_args(ids=["p1"], refs=2))
+        assert [r["paperId"] for r in json.loads(capsys.readouterr().out)["references"]] == ["r0", "r1"]
+
+    @pytest.mark.asyncio
+    async def test_no_full_text_warns_loudly(self, mock_client, capsys):
+        self._setup(mock_client, paper={"paperId": "p9", "title": "Lost Paper", "externalIds": {}})
+        with patch("s2._http_client", _http({})):
+            await cmd_read(make_args(ids=["p9"], refs=0))
+
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        assert out["fullTextSource"] is None and out["fullTextPath"] is None
+        assert "p9: no full text found" in captured.err
+        assert "'Lost Paper'" in captured.err
+        assert out["pdfPath"] is None and out["figures"] == []
+
+    @pytest.mark.asyncio
+    async def test_saves_pdf_and_lists_figures(self, mock_client, capsys):
+        self._setup(mock_client)
+        html = ARXIV_HTML.replace("<button>", "<figure><figcaption>Figure 1: The pipeline.</figcaption></figure><button>")
+        routes = {
+            "https://arxiv.org/html/2604.00001": (200, html.encode()),
+            "https://arxiv.org/pdf/2604.00001": (200, b"%PDF-1.7 body"),
+        }
+        with patch("s2.pdf_pages", return_value=["Intro", "Figure 1: The pipeline."]), \
+                patch("s2._http_client", _http(routes)):
+            await cmd_read(make_args(ids=["p1"], refs=0))
+
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        assert Path(out["pdfPath"]) == self.cache / "p1.pdf"
+        assert Path(out["pdfPath"]).read_bytes() == b"%PDF-1.7 body"
+        assert out["figures"] == [{"label": "Figure 1", "caption": "Figure 1: The pipeline.", "page": 2}]
+        assert "[Figure 1, PDF page 2] Figure 1: The pipeline." in Path(out["fullTextPath"]).read_text()
+        assert "warning" not in captured.err
+
+    @pytest.mark.asyncio
+    async def test_text_without_pdf_warns(self, mock_client, capsys):
+        self._setup(mock_client)
+        routes = {"https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode())}
+        with patch("s2._http_client", _http(routes)):
+            await cmd_read(make_args(ids=["p1"], refs=0))
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["pdfPath"] is None
+        assert "p1: no PDF found, so figures are unavailable" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_unreadable_pdf_keeps_text(self, mock_client, capsys):
+        from pypdf.errors import PdfReadError
+
+        self._setup(mock_client)
+        routes = {
+            "https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode()),
+            "https://arxiv.org/pdf/2604.00001": (200, b"%PDF-broken"),
+        }
+        with patch("s2.pdf_pages", side_effect=PdfReadError("bad")), patch("s2._http_client", _http(routes)):
+            await cmd_read(make_args(ids=["p1"], refs=0))
+        out = json.loads(capsys.readouterr().out)
+        assert out["fullTextSource"] == "arxiv-html" and out["figures"] == []
+        assert out["pdfPath"] is not None
+
+    @pytest.mark.asyncio
+    async def test_cache_reused(self, mock_client, capsys):
+        calls = []
+        routes = {"https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode())}
+        for _ in range(2):
+            self._setup(mock_client)
+            with patch("s2._http_client", _http(routes, calls)):
+                await cmd_read(make_args(ids=["p1"], refs=0))
+
+        first, second = (json.loads(line) for line in capsys.readouterr().out.splitlines())
+        assert calls == ["https://arxiv.org/html/2604.00001", "https://arxiv.org/pdf/2604.00001"]
+        assert first == second
+
+    @pytest.mark.asyncio
+    async def test_cache_reuses_pdf_and_figures(self, mock_client, capsys):
+        calls = []
+        routes = {
+            "https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode()),
+            "https://arxiv.org/pdf/2604.00001": (200, b"%PDF-1.7"),
+        }
+        with patch("s2.pdf_pages", return_value=["Table 1: Results."]) as pages:
+            for _ in range(2):
+                self._setup(mock_client)
+                with patch("s2._http_client", _http(routes, calls)):
+                    await cmd_read(make_args(ids=["p1"], refs=0))
+        first, second = (json.loads(line) for line in capsys.readouterr().out.splitlines())
+        assert len(calls) == 2 and pages.call_count == 1
+        assert first == second and second["figures"][0]["label"] == "Table 1"
+
+    @pytest.mark.asyncio
+    async def test_cache_without_figures_is_refetched(self, mock_client, capsys):
+        (self.cache / "p1.txt").write_text("old text\n")
+        (self.cache / "p1.json").write_text(json.dumps({"sections": [], "source": "arxiv-html"}))
+        self._setup(mock_client)
+        routes = {"https://arxiv.org/html/2604.00001": (200, ARXIV_HTML.encode())}
+        with patch("s2._http_client", _http(routes)):
+            await cmd_read(make_args(ids=["p1"], refs=0))
+        out = json.loads(capsys.readouterr().out)
+        assert "Context collapse is common." in Path(out["fullTextPath"]).read_text()
+
+    @pytest.mark.asyncio
+    async def test_reads_ids_from_piped_search_output(self, mock_client):
+        self._setup(mock_client)
+        piped = io.StringIO('{"paperId": "p1", "title": "A"}\n{"paperId": "p2", "title": "B"}\n')
+        with patch("sys.stdin", piped), patch("s2._http_client", _http({})):
+            await cmd_read(make_args(ids=None, refs=0))
+        assert mock_client.get_papers.call_args.args[0] == ["p1", "p2"]
+
+    @pytest.mark.asyncio
+    async def test_not_found_ids_reported(self, mock_client, capsys):
+        mock_client.get_papers.return_value = ([], ["ArXiv:9999.99999"])
+        with patch("s2._http_client", _http({})):
+            await cmd_read(make_args(ids=["ArXiv:9999.99999"], refs=0))
+        assert "error: not found: ArXiv:9999.99999" in capsys.readouterr().err
+
+    def test_rejects_date_for_year(self, capsys):
+        with patch("sys.argv", ["s2", "read", "-i", "p1", "-y", "2026-06-01"]), pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2

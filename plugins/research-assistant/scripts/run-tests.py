@@ -10,6 +10,7 @@
 #     "httpcore==1.0.9",
 #     "idna==3.11",
 #     "nest-asyncio==1.6.0",
+#     "pypdf==6.21.4",
 #     "socksio==1.0.0",
 #     "tenacity==9.1.4",
 #     "typing_extensions==4.15.0",
