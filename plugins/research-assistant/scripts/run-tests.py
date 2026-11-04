@@ -13,6 +13,7 @@
 #     "pypdf==6.21.4",
 #     "socksio==1.0.0",
 #     "tenacity==9.1.4",
+#     "truststore==0.10.5",
 #     "typing_extensions==4.15.0",
 #     "pytest==9.0.2",
 #     "pytest-asyncio==1.3.0",
