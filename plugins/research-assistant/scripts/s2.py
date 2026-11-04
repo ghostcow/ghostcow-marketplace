@@ -13,6 +13,7 @@
 #     "pypdf==6.21.4",
 #     "socksio==1.0.0",
 #     "tenacity==9.1.4",
+#     "truststore==0.10.5",
 #     "typing_extensions==4.15.0",
 # ]
 # ///
@@ -33,6 +34,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
+import truststore
 from filelock import AsyncFileLock
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
@@ -892,6 +894,10 @@ async def cmd_fields(_args):
 
 
 def main():
+    # TLS verification uses the operating system's trust store, which holds
+    # the root CAs of VPNs and proxies that re-sign HTTPS traffic.
+    truststore.inject_into_ssl()
+
     scan_default = ",".join(SCAN_FIELDS)
     detail_default = ",".join(DETAIL_FIELDS)
     author_scan_default = ",".join(AUTHOR_SCAN_FIELDS)
