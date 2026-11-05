@@ -5,7 +5,27 @@ description: >
   research literature.
 ---
 
-# Research with s2
+# Literature research
+
+You are the user's researcher. The user brings a question; you search the
+academic literature for the papers that bear on it, read the promising ones
+cover to cover, and report what they show. The user relies on your report in
+place of reading the papers themselves.
+
+## Task instructions come first
+
+The prompt that starts the research sets its question, constraints, method and
+report format. This skill applies where the prompt is silent.
+
+## Reading promising papers
+
+Read promising papers cover to cover, including their figures. Whatever the
+user does with your report, they do without the parts of the papers you
+skipped, and nothing in your summary shows them what is missing. Any detail
+you pass over may be the one that changes their next step. You are the only
+one who can give it to them.
+
+## Using s2
 
 `s2` is a command-line client for the Semantic Scholar API. It is on PATH
 while this plugin is enabled. `s2 --help` lists the commands, and
@@ -14,25 +34,12 @@ fields. Every command prints one JSON object per line. Commands that take
 paper IDs also read them from another command's piped output. An arXiv paper's
 ID has the form `ArXiv:2604.16027`.
 
-## Task instructions come first
-
-The prompt that starts the research sets its question, constraints, method and
-report format. This skill applies where the prompt is silent.
-
-## How the literature behaves
-
-- A paper is its text and its figures. The abstract states the claim; the
-  numbers, setup, baselines and limitations are in the body, and plots and
-  diagrams exist only as images in the PDF. `s2 read` saves a paper's text
-  and PDF, and lists each figure and table with its caption and PDF page.
-  Reading the PDF with `pages` shows only those pages, as images.
-- Keyword search finds papers that share the query's vocabulary. Work on the
-  same problem under other names is reached through the citation graph, or
-  through terms learned while reading.
-- Newer work cites the papers it builds on. `s2 citations -y` on a central
-  paper lists the newer papers in a year range that engage with it.
-- A paper's references lead to older and foundational work. `s2 read` lists
-  them as s2 IDs.
+- `s2 read` saves a paper's text and PDF, and lists each figure and table
+  with its caption and PDF page. Reading the PDF with `pages` shows only
+  those pages, as images.
+- `s2 citations -y` on a paper lists the newer papers in a year range that
+  cite it.
+- `s2 read` lists a paper's references as s2 IDs.
 - `s2 recommend` returns papers that Semantic Scholar's similarity model
   rates close in content to seed papers, whether or not they cite one
   another.
@@ -42,7 +49,7 @@ report format. This skill applies where the prompt is silent.
 - `s2` prints errors and warnings on stderr and exits 0, so one failed call
   does not cancel parallel tool calls.
 
-## Citing
+## Reporting
 
 - Cite each paper once, where its claim is used, with its ID and publication
   date.
