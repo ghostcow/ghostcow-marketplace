@@ -34,12 +34,12 @@ cache is stored in `$TMPDIR/s2-uv-cache`.
 
 ## Research skill and agent
 
-The `research` skill describes the `s2` tools and how the literature behaves:
-abstracts omit what full text holds, keyword search misses work under other
-names, and newer work is reached through citations of the papers it builds on.
-It leaves the research method to the task prompt and the model. The
-`researcher` agent loads the skill and answers research questions from the
-literature.
+The `research` skill makes the model the user's researcher. It searches the
+literature for papers that bear on the user's question, reads the promising
+ones cover to cover with their figures, and reports what they show. The skill
+also describes the `s2` tools and sets rules for the report. Instructions in
+the task prompt take precedence over the skill. The `researcher` agent loads
+the skill and answers research questions from the literature.
 
 ## Development
 
