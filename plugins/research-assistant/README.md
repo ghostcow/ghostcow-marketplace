@@ -13,7 +13,7 @@ A Claude Code plugin for academic research — finding papers, exploring citatio
 | `citations` | Get papers that cite a given paper |
 | `references` | Get papers cited by a given paper |
 | `recommend` | Recommend papers from seed paper(s) |
-| `read` | Save a paper's full text and PDF, with its figures and references |
+| `read` | Save a paper's PDF to read with the Read tool, first page to last |
 | `search-author` | Search authors by name |
 | `author-papers` | Get papers by author ID(s) |
 | `fields` | List all available field names for `-f` |
@@ -35,11 +35,10 @@ cache is stored in `$TMPDIR/s2-uv-cache`.
 ## Research skill and agent
 
 The `research` skill makes the model the user's researcher. It searches the
-literature for papers that bear on the user's question, reads the promising
-ones cover to cover with their figures, and reports what they show. The skill
-also describes the `s2` tools and sets rules for the report. Instructions in
-the task prompt take precedence over the skill. The `researcher` agent loads
-the skill and answers research questions from the literature.
+literature for papers that bear on the user's question, reads the relevant
+ones in full with their figures, and reports what they show. The skill also
+describes the `s2` tools and sets rules for the report. The `researcher` agent
+loads the skill and answers research questions from the literature.
 
 ## Development
 

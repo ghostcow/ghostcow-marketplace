@@ -1,7 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "semanticscholar==0.11.0",
 #     "filelock==3.25.0",
 #     "httpx[socks]==0.28.1",
 #     "anyio==4.12.1",
@@ -9,8 +8,6 @@
 #     "h11==0.16.0",
 #     "httpcore==1.0.9",
 #     "idna==3.11",
-#     "nest-asyncio==1.6.0",
-#     "pypdf==6.21.4",
 #     "socksio==1.0.0",
 #     "tenacity==9.1.4",
 #     "truststore==0.10.5",
@@ -20,9 +17,8 @@
 
 import argparse
 import asyncio
-import io
+import hashlib
 import json
-import logging
 import os
 import re
 import sys
@@ -30,24 +26,13 @@ import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from functools import partial
-from html.parser import HTMLParser
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, Required, TypedDict
 
 import httpx
 import truststore
 from filelock import AsyncFileLock
-from pypdf import PdfReader
-from pypdf.errors import PyPdfError
-from semanticscholar import AsyncSemanticScholar
-from semanticscholar.ApiRequester import ApiRequester
-from semanticscholar.Citation import Citation
-from semanticscholar.Paper import Paper
-from semanticscholar.PaginatedResults import PaginatedResults
-from semanticscholar.SemanticScholarException import (
-    BadQueryParametersException,
-    ObjectNotFoundException,
-    ServerErrorException,
-)
 from tenacity import (
     AsyncRetrying,
     RetryError,
@@ -134,12 +119,80 @@ CITATION_EXTRAS = (
 # S2 answers 429 to 40-60% of keyed requests even at one request per 4 s
 # (measured 2026-11-01), so a request gets many attempts with a short backoff.
 RETRY_WAIT = wait_exponential(multiplier=1, min=1, max=10) + wait_random(0, 1)
-RETRY_EXCEPTIONS = retry_if_exception_type((ConnectionRefusedError, ServerErrorException))
 RETRY_ATTEMPTS = 10
 _RATE_INTERVAL = 1.1
 _RATE_DIR = os.environ.get("TMPDIR", "/tmp")
 _RATE_LOCK = os.path.join(_RATE_DIR, "s2_rate.lock")
 _RATE_TS = os.path.join(_RATE_DIR, "s2_rate.ts")
+
+API_URL = "https://api.semanticscholar.org"
+GRAPH_URL = f"{API_URL}/graph/v1"
+RECOMMENDATIONS_URL = f"{API_URL}/recommendations/v1"
+# Largest offset + limit each paged endpoint accepts: relevance search answers
+# 400 above 1000; the other paged endpoints, author search included, answer 400
+# at 10000 and above.
+SEARCH_WINDOW = 1000
+PAGED_WINDOW = 9999
+
+
+# Shapes of the API responses this script reads fields from. Every other field
+# passes through untouched, so these name only the keys the code uses; total=False
+# because which keys are present depends on the requested fields.
+
+
+class Paper(TypedDict, total=False):
+    paperId: Required[str | None]  # always returned; null only for unresolved nested references
+    title: str | None
+    year: int | None
+    externalIds: dict[str, str] | None
+    openAccessPdf: dict | None
+    citationCount: int | None
+
+
+class CitationEdge(TypedDict, total=False):
+    """An item of /paper/{id}/citations; citingPaper is missing or null for removed papers."""
+
+    citingPaper: Paper | None
+
+
+class ReferenceEdge(TypedDict, total=False):
+    """An item of /paper/{id}/references; citedPaper is missing or null for removed papers."""
+
+    citedPaper: Paper | None
+
+
+class Page(TypedDict, total=False):
+    """One page of an offset-paged endpoint. next is absent on the last page; data is
+    absent on an empty search result."""
+
+    offset: int
+    next: int
+    total: int
+    data: list[dict]
+
+
+class Recommendations(TypedDict, total=False):
+    recommendedPapers: list[Paper]
+
+
+class S2Error(Exception):
+    """An S2 API response that is an error rather than data."""
+
+
+class BadQueryParametersException(S2Error):
+    """HTTP 400: the API rejected the request's parameters."""
+
+
+class ObjectNotFoundException(S2Error):
+    """HTTP 404: the paper, author or title match does not exist."""
+
+
+class ServerErrorException(S2Error):
+    """HTTP 5xx: a server-side failure, retried."""
+
+
+class S2APIError(S2Error):
+    """A status or body the API contract does not define."""
 
 
 class RateLimitedError(ConnectionRefusedError):
@@ -148,6 +201,9 @@ class RateLimitedError(ConnectionRefusedError):
     def __init__(self, retry_after):
         super().__init__("HTTP status 429 Too Many Requests.")
         self.retry_after = retry_after
+
+
+RETRY_EXCEPTIONS = retry_if_exception_type((ConnectionRefusedError, ServerErrorException))
 
 
 def _parse_retry_after(value):
@@ -170,33 +226,47 @@ def _retry_wait(retry_state):
     return retry_after if retry_after is not None else RETRY_WAIT(retry_state)
 
 
+def _error_message(r):
+    """The message of an error response: its "error" field (graph API) or "message" field (gateway)."""
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text[:200] or f"HTTP status {r.status_code}."
+    if isinstance(body, dict):
+        return body.get("error") or body.get("message") or f"HTTP status {r.status_code}."
+    return f"HTTP status {r.status_code}."
+
+
 def _parse_response(r):
-    """Map an S2 response to data or an exception, as the SDK's ApiRequester does."""
+    """Map an S2 response to its JSON body, or raise the exception for its status."""
     if r.status_code == 200:
         data = r.json()
-        return {} if len(data) == 1 and "error" in data else data
+        if isinstance(data, dict) and set(data) == {"error"}:
+            raise S2APIError(data["error"])
+        return data
     if r.status_code == 400:
-        raise BadQueryParametersException(r.json()["error"])
-    if r.status_code == 403:
-        raise PermissionError("HTTP status 403 Forbidden.")
+        raise BadQueryParametersException(_error_message(r))
+    if r.status_code in (401, 403):
+        raise PermissionError(f"HTTP status {r.status_code} {_error_message(r)}")
     if r.status_code == 404:
-        raise ObjectNotFoundException(r.json()["error"])
+        raise ObjectNotFoundException(_error_message(r))
     if r.status_code == 429:
         raise RateLimitedError(_parse_retry_after(r.headers.get("Retry-After")))
     if r.status_code >= 500:
         raise ServerErrorException(f"HTTP status {r.status_code}.")
-    return {}
+    raise S2APIError(f"unexpected HTTP status {r.status_code}: {_error_message(r)}")
 
 
-class S2Requester(ApiRequester):
+class S2Requester:
+    """Sends S2 API requests through the cross-process rate limit, retrying 429 and 5xx."""
+
     def __init__(self, timeout, retry, auth_header=None):
-        super().__init__(timeout, retry)
+        self.timeout = timeout
+        self.retry = retry
         self.auth_header = auth_header or {}
 
-    async def get_data_async(self, url, parameters, headers, payload=None):
-        # The SDK passes no headers for citations, references and author papers,
-        # so the API key is merged in here for every request.
-        headers = {**self.auth_header, **(headers or {})}
+    async def request(self, url, params, payload=None) -> Any:
+        """GET url (POST when payload is given) with query params; returns the parsed JSON body."""
         retrying = AsyncRetrying(
             retry=RETRY_EXCEPTIONS,
             wait=_retry_wait,
@@ -204,9 +274,10 @@ class S2Requester(ApiRequester):
         )
         async for attempt in retrying:
             with attempt:
-                return await self._throttled_request(url, parameters, headers, payload)
+                return await self._throttled_request(url, params, payload)
+        raise AssertionError("unreachable: tenacity raises RetryError once attempts run out")
 
-    async def _throttled_request(self, url, parameters, headers, payload):
+    async def _throttled_request(self, url, params, payload):
         # Cross-process rate limit: the file lock serializes every request of
         # every s2 process, retries included, and is held until the response
         # arrives. The timestamp file's mtime marks the last response, so the
@@ -224,9 +295,9 @@ class S2Requester(ApiRequester):
                     r = await client.request(
                         "POST" if payload else "GET",
                         url,
-                        params=parameters.lstrip("&"),
+                        params=params,
                         timeout=self.timeout,
-                        headers=headers,
+                        headers=self.auth_header,
                         json=payload,
                     )
             finally:
@@ -234,56 +305,140 @@ class S2Requester(ApiRequester):
         return _parse_response(r)
 
 
-class _ParamResults(PaginatedResults):
-    """PaginatedResults that appends fixed query parameters to every page request."""
+class S2Client:
+    """Client for the S2 Graph and Recommendations APIs; every result is the API's JSON object.
 
-    def __init__(self, *args, extra_params, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._extra_params = extra_params
+    Paged methods are coroutines returning an async iterator over all items the
+    endpoint's window allows; callers stop iterating once they have enough.
+    """
 
-    def _build_params(self):
-        super()._build_params()
-        self._parameters += self._extra_params
+    def __init__(self, api_key=None, timeout=30, retry=True):
+        self.auth_header = {"x-api-key": api_key} if api_key else {}
+        self._requester = S2Requester(timeout, retry, self.auth_header)
 
+    async def _request(self, url, params, payload=None) -> Any:
+        return await self._requester.request(url, params, payload)
 
-class S2Client(AsyncSemanticScholar):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._requester = S2Requester(self._timeout, self._retry, self.auth_header)
+    async def _pages(self, url, params, page_size, window) -> AsyncIterator[Any]:
+        """Yield the items of an offset-paged endpoint, requesting page_size items at a time.
 
-    async def get_paper_citations(self, paper_id, fields=None, limit=100, publication_date_or_year=None):
-        # The citations endpoint filters citing papers by publicationDateOrYear;
-        # the SDK method exposes no parameter for it.
-        if publication_date_or_year is None:
-            return await super().get_paper_citations(paper_id, fields=fields, limit=limit)
-        return await _ParamResults.create(
-            requester=self._requester,
-            data_type=Citation,
-            url=f"{self.api_url}{self.BASE_PATH_GRAPH}/paper/{paper_id}/citations",
-            fields=fields,
-            limit=limit,
-            extra_params=f"&publicationDateOrYear={publication_date_or_year}",
-        )
+        The API keeps offset + limit within window. Paging ends at the first page
+        without items, without an integer "next", or whose "next" does not move past
+        its offset, so no response can make the same page be requested twice.
+        """
+        offset = 0
+        while offset < window:
+            page: Page = await self._request(url, {**params, "offset": offset, "limit": min(page_size, window - offset)})
+            items = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(items, list) or not items:
+                return
+            for item in items:
+                yield item
+            next_offset = page.get("next")
+            if not isinstance(next_offset, int) or next_offset <= offset:
+                return
+            offset = next_offset
 
-    async def get_papers(self, paper_ids, fields=None, return_not_found=False):
+    async def search_paper(self, query, fields, limit, **filters) -> AsyncIterator[Paper]:
+        """Relevance search over papers; filters are the keyword arguments of _search_params."""
+        return self._pages(f"{GRAPH_URL}/paper/search", _search_params(query, fields, **filters), limit, SEARCH_WINDOW)
+
+    async def match_paper_title(self, query, fields, **filters) -> Paper:
+        """The paper whose title best matches query; raises ObjectNotFoundException when none does."""
+        page = await self._request(f"{GRAPH_URL}/paper/search/match", _search_params(query, fields, **filters))
+        data = page.get("data") if isinstance(page, dict) else None
+        if not data:
+            raise ObjectNotFoundException("Title match not found")
+        return data[0]
+
+    async def search_author(self, query, fields, limit) -> AsyncIterator[dict]:
+        return self._pages(f"{GRAPH_URL}/author/search", {"query": query, "fields": ",".join(fields)}, limit, PAGED_WINDOW)
+
+    async def get_paper_citations(
+        self, paper_id, fields, limit, publication_date_or_year=None
+    ) -> AsyncIterator[CitationEdge]:
+        """Citation edges, each {"citingPaper": {...}, ...}."""
+        params = {"fields": ",".join(fields)}
+        if publication_date_or_year:
+            params["publicationDateOrYear"] = publication_date_or_year
+        return self._pages(f"{GRAPH_URL}/paper/{paper_id}/citations", params, limit, PAGED_WINDOW)
+
+    async def get_paper_references(self, paper_id, fields, limit) -> AsyncIterator[ReferenceEdge]:
+        """Reference edges, each {"citedPaper": {...}, ...}."""
+        return self._pages(f"{GRAPH_URL}/paper/{paper_id}/references", {"fields": ",".join(fields)}, limit, PAGED_WINDOW)
+
+    async def get_author_papers(self, author_id, fields, limit) -> AsyncIterator[Paper]:
+        return self._pages(f"{GRAPH_URL}/author/{author_id}/papers", {"fields": ",".join(fields)}, limit, PAGED_WINDOW)
+
+    async def get_papers(self, paper_ids, fields) -> tuple[list[Paper], list[str] | None]:
+        """Papers for up to 500 IDs, and the IDs that did not resolve."""
         # The batch endpoint answers with one entry per input ID, in input order,
         # null for IDs it cannot resolve. Not-found IDs come from that position.
         # not_found is None when the response length does not match the input,
         # since positions then say nothing about which IDs resolved.
         if len(paper_ids) > 500 or len(paper_ids) == 0:
             raise ValueError("The paper_ids parameter must be a list of 1 to 500 IDs.")
-        data = await self._requester.get_data_async(
-            f"{self.api_url}{self.BASE_PATH_GRAPH}/paper/batch",
-            f"&fields={','.join(fields or Paper.SEARCH_FIELDS)}",
-            self.auth_header,
-            {"ids": paper_ids},
-        )
-        papers = [Paper(item) for item in data if item is not None]
-        if not return_not_found:
-            return papers
+        data = await self._request(f"{GRAPH_URL}/paper/batch", {"fields": ",".join(fields)}, {"ids": paper_ids})
+        if not isinstance(data, list):
+            raise S2APIError(f"paper batch answered {type(data).__name__}, expected a list")
+        papers = [item for item in data if item is not None]
         if len(data) != len(paper_ids):
             return papers, None
         return papers, [pid for pid, item in zip(paper_ids, data) if item is None]
+
+    async def get_recommended_papers(self, paper_id, fields, limit, pool_from="recent") -> list[Paper]:
+        data = await self._request(
+            f"{RECOMMENDATIONS_URL}/papers/forpaper/{paper_id}",
+            {"fields": ",".join(fields), "limit": limit, "from": pool_from},
+        )
+        return _recommended(data)
+
+    async def get_recommended_papers_from_lists(
+        self, positive_paper_ids, fields, limit, negative_paper_ids=None
+    ) -> list[Paper]:
+        payload = {"positivePaperIds": positive_paper_ids, "negativePaperIds": negative_paper_ids or []}
+        data = await self._request(
+            f"{RECOMMENDATIONS_URL}/papers/", {"fields": ",".join(fields), "limit": limit}, payload
+        )
+        return _recommended(data)
+
+
+def _search_params(
+    query,
+    fields,
+    year=None,
+    publication_date_or_year=None,
+    publication_types=None,
+    open_access_pdf=False,
+    venue=None,
+    fields_of_study=None,
+    min_citation_count=None,
+):
+    """Query parameters shared by /paper/search and /paper/search/match."""
+    params = {"query": query, "fields": ",".join(fields)}
+    if year:
+        params["year"] = year
+    if publication_date_or_year:
+        params["publicationDateOrYear"] = publication_date_or_year
+    if publication_types:
+        params["publicationTypes"] = ",".join(publication_types)
+    if open_access_pdf:
+        params["openAccessPdf"] = ""
+    if venue:
+        params["venue"] = ",".join(venue)
+    if fields_of_study:
+        params["fieldsOfStudy"] = ",".join(fields_of_study)
+    if min_citation_count:
+        params["minCitationCount"] = min_citation_count
+    return params
+
+
+def _recommended(data: Recommendations) -> list[Paper]:
+    """The recommendedPapers list of a recommendations response."""
+    papers = data.get("recommendedPapers") if isinstance(data, dict) else None
+    if not isinstance(papers, list):
+        raise S2APIError("recommendations response has no recommendedPapers list")
+    return papers
 
 
 YEAR_RANGE = re.compile(r"\d{4}|\d{4}-\d{4}|\d{4}-|-\d{4}")
@@ -350,6 +505,24 @@ def make_client():
     return S2Client(api_key=api_key)
 
 
+RECOMMEND_MAX = 500  # the recommendations endpoints return at most 500 papers
+
+
+def _page_size(limit, page_max):
+    """Items to request per page: the whole limit when it fits in one page, else the endpoint's page maximum."""
+    return page_max if limit is None else min(limit, page_max)
+
+
+async def _output_up_to(results, limit):
+    """Print items from results, stopping after limit of them; limit None prints every item."""
+    count = 0
+    async for item in results:
+        output(item)
+        count += 1
+        if limit is not None and count >= limit:
+            break
+
+
 async def cmd_search(args):
     client = make_client()
     fields = args.fields.split(",") if args.fields else SCAN_FIELDS
@@ -370,20 +543,11 @@ async def cmd_search(args):
     if args.min_citations:
         kwargs["min_citation_count"] = args.min_citations
     if args.match_title:
-        kwargs["match_title"] = True
-    results = await client.search_paper(args.query, fields=fields, limit=min(limit, 100), **kwargs)
-    if args.match_title:
-        # SDK raises ObjectNotFoundException (caught in main) if no match.
-        output(results.raw_data)
+        # No match raises ObjectNotFoundException, which main reports.
+        output(await client.match_paper_title(args.query, fields=fields, **kwargs))
         return
-    if results is None:
-        return
-    count = 0
-    async for paper in results:
-        output(paper.raw_data)
-        count += 1
-        if count >= limit:
-            break
+    results = await client.search_paper(args.query, fields=fields, limit=_page_size(limit, 100), **kwargs)
+    await _output_up_to(results, limit)
 
 
 async def cmd_get(args):
@@ -395,9 +559,9 @@ async def cmd_get(args):
         sys.exit(0)
     for i in range(0, len(ids), 500):
         chunk = ids[i : i + 500]
-        papers, not_found = await client.get_papers(chunk, fields=fields, return_not_found=True)
+        papers, not_found = await client.get_papers(chunk, fields=fields)
         for paper in papers:
-            output(paper.raw_data)
+            output(paper)
         if not_found is None:
             print(
                 f"error: status unknown (API returned {len(papers)} results for {len(chunk)} IDs, "
@@ -417,50 +581,45 @@ def _describe_error(exc):
         return "S2 API rate limited after retries. The request cannot be completed right now."
     if isinstance(exc, ObjectNotFoundException):
         return "Not found on Semantic Scholar. Verify the paper ID is correct."
+    if isinstance(exc, PermissionError):
+        return "Forbidden. Check your S2_API_KEY."
     if isinstance(exc, httpx.TimeoutException):
         return "S2 API request timed out, server didn't respond."
     return str(exc)
 
 
-def _extract_citation(item):
-    """Extract raw_data from a citation/reference, or None if the nested paper is missing.
+def _extract_citation(item: CitationEdge | ReferenceEdge) -> CitationEdge | ReferenceEdge | None:
+    """A citation or reference edge, or None when it has no nested paper.
 
-    The S2 API can return citation edges where the cited/citing paper has been
-    removed or is unavailable — the SDK leaves item.paper as None in that case.
+    The S2 API can return edges whose citingPaper/citedPaper is missing or null
+    because the paper was removed or is unavailable.
     """
-    return item.raw_data if item.paper else None
+    paper = item.get("citingPaper", item.get("citedPaper"))
+    return item if paper is not None else None
 
 
-def _extract_paper(item):
-    """Extract raw_data from a paper object.
-
-    No guard needed — unlike citations, paper items are the paper itself,
-    not a wrapper with an optional nested field.
-    """
-    return item.raw_data
+def _extract_paper(item: Paper) -> Paper:
+    """A paper item, which is the paper itself rather than an edge around one."""
+    return item
 
 
 async def gather_paginated(client_method, ids, fields, limit, source_key, extract):
     """Fetch paginated results for multiple IDs concurrently, skipping failures."""
 
     async def fetch(source_id):
-        results = await client_method(source_id, fields=fields, limit=min(limit, 1000))
-        if results is None:
-            return []
+        results = await client_method(source_id, fields=fields, limit=_page_size(limit, 1000))
         items = []
-        count = 0
         async for item in results:
             raw = extract(item)
             if raw is not None:
                 items.append({**raw, source_key: source_id})
-                count += 1
-                if count >= limit:
+                if limit is not None and len(items) >= limit:
                     break
         return items
 
     outcomes = await asyncio.gather(*[fetch(sid) for sid in ids], return_exceptions=True)
     for source_id, outcome in zip(ids, outcomes, strict=True):
-        if isinstance(outcome, Exception):
+        if isinstance(outcome, BaseException):
             print(f"error: {source_id}: {_describe_error(outcome)}", file=sys.stderr)
         else:
             for item in outcome:
@@ -498,7 +657,7 @@ async def cmd_recommend(args):
     if not ids:
         print("error: no paper IDs provided", file=sys.stderr)
         sys.exit(0)
-    limit = min(args.limit, 500)
+    limit = _page_size(args.limit, RECOMMEND_MAX)
     negative_ids = list(args.negative_ids) if args.negative_ids else None
     if len(ids) == 1 and not negative_ids:
         papers = await client.get_recommended_papers(ids[0], fields=fields, limit=limit, pool_from=args.pool)
@@ -511,8 +670,6 @@ async def cmd_recommend(args):
         papers = await client.get_recommended_papers_from_lists(
             ids, fields=fields, limit=limit, negative_paper_ids=negative_ids
         )
-    if papers is None:
-        return
     if not papers:
         # The API answers 200 with an empty list when the pool holds nothing
         # similar; single-seed "recent" is often empty for older or non-CS seeds.
@@ -523,22 +680,15 @@ async def cmd_recommend(args):
         print(f"warning: no recommendations returned for {', '.join(ids)}{hint}", file=sys.stderr)
         return
     for paper in papers:
-        output(paper.raw_data)
+        output(paper)
 
 
 async def cmd_search_author(args):
     client = make_client()
     fields = args.fields.split(",") if args.fields else AUTHOR_SCAN_FIELDS
     limit = args.limit
-    results = await client.search_author(args.query, fields=fields, limit=min(limit, 1000))
-    if results is None:
-        return
-    count = 0
-    async for author in results:
-        output(author.raw_data)
-        count += 1
-        if count >= limit:
-            break
+    results = await client.search_author(args.query, fields=fields, limit=_page_size(limit, 1000))
+    await _output_up_to(results, limit)
 
 
 async def cmd_author_papers(args):
@@ -552,25 +702,13 @@ async def cmd_author_papers(args):
 
 
 READ_FIELDS = ["paperId", "title", "year", "externalIds", "openAccessPdf", "citationCount"]
-REF_FIELDS = ["paperId", "title", "year"]
+# Printed with every saved PDF so the reminder travels with the paper it applies to.
+READ_NOTE = "To report on this paper, read this PDF with the Read tool from the first page to the last."
 FETCH_HEADERS = {"User-Agent": "s2-cli/1.0 (research-assistant plugin; full-text reader)"}
 FETCH_TIMEOUT = 60
 FETCH_ATTEMPTS = 3
-# pypdf logs recoverable PDF-structure problems as warnings; they are noise on stderr.
-logging.getLogger("pypdf").setLevel(logging.ERROR)
-_HEADING_TAGS = {f"h{i}": i for i in range(1, 7)}
-_BLOCK_TAGS = {"p", "div", "section", "li", "tr", "table", "figure", "figcaption", "br", "blockquote", "pre", "dd", "dt"}
-_SKIP_TAGS = {"script", "style", "nav", "header", "footer", "button", "noscript", "svg"}
-_PDF_HEADING = re.compile(
-    r"(?:\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z\-:,&' ]{1,60}"
-    r"|(?:Abstract|Introduction|Related Work|Background|Method|Methods|Experiments|Results|Discussion"
-    r"|Conclusion|Conclusions|Limitations|References|Appendix|Acknowledgements|Acknowledgments))"
-)
-# A caption line starts with its label: "Figure 3: ...", "Fig. 3. ...", "Table 2 | ...", "FIGURE 3",
-# "Figure 3 Flow diagram". Lines where a lowercase word follows the label ("Figure 3 shows") are
-# in-text mentions and do not match.
-_CAPTION = re.compile(r"(FIGURE|Figure|Fig\.|TABLE|Table)\s*(\d+)(?![\d.]\d)(.*)")
-_CAPTION_MARK = re.compile(r"\[((?:Figure|Table) \d+), PDF page \d+\] ")
+# A read's output (metadata and citation counts included) is reused for this long.
+READ_CACHE_SECONDS = 24 * 60 * 60
 
 
 def _cache_dir():
@@ -578,90 +716,6 @@ def _cache_dir():
         return Path(os.environ["S2_CACHE_DIR"])
     # The Claude Code sandbox allows writes under TMPDIR, not the home directory.
     return Path(os.environ.get("TMPDIR", "/tmp")) / "s2-papers"
-
-
-class _HtmlText(HTMLParser):
-    """Plain text of an arXiv (LaTeXML) HTML paper, headings marked with '#'.
-
-    Text inside <article> is kept when the page has one; math is replaced by
-    its LaTeX alttext.
-    """
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts = {False: [], True: []}
-        self.sections = {False: [], True: []}
-        self._article = 0
-        self._skip = 0
-        self._heading = None
-        self._heading_text = []
-
-    def _emit(self, text):
-        self.parts[self._article > 0].append(text)
-        if self._heading is not None:
-            self._heading_text.append(text)
-
-    def handle_starttag(self, tag, attrs):
-        if self._skip or tag in _SKIP_TAGS:
-            if tag in _SKIP_TAGS or tag == "math":
-                self._skip += 1
-            return
-        if tag == "article":
-            self._article += 1
-        elif tag == "math":
-            self._emit(f" {dict(attrs).get('alttext', '')} ")
-            self._skip += 1
-        elif tag in _HEADING_TAGS:
-            self._emit("\n\n" + "#" * _HEADING_TAGS[tag] + " ")
-            self._heading, self._heading_text = tag, []
-        elif tag in _BLOCK_TAGS:
-            self._emit("\n")
-
-    def handle_endtag(self, tag):
-        if self._skip:
-            if tag in _SKIP_TAGS or tag == "math":
-                self._skip -= 1
-            return
-        if tag == "article":
-            self._article -= 1
-        elif tag == self._heading:
-            heading = " ".join("".join(self._heading_text).split())
-            if heading:
-                self.sections[self._article > 0].append(heading)
-            self._heading = None
-            self._emit("\n")
-        elif tag in _BLOCK_TAGS:
-            self._emit("\n")
-
-    def handle_data(self, data):
-        if not self._skip:
-            self._emit(data)
-
-    def result(self):
-        in_article = bool(self.parts[True])
-        text = "".join(self.parts[in_article])
-        lines = [" ".join(line.split()) if not line.startswith("#") else line.strip() for line in text.splitlines()]
-        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n", self.sections[in_article]
-
-
-def html_to_text(html):
-    """Return (text, sections) for an arXiv HTML paper."""
-    parser = _HtmlText()
-    parser.feed(html)
-    parser.close()
-    return parser.result()
-
-
-def pdf_pages(data):
-    """Text of each page of PDF bytes."""
-    return [page.extract_text() or "" for page in PdfReader(io.BytesIO(data)).pages]
-
-
-def pdf_to_text(data):
-    """Return (text, sections) for PDF bytes; sections are best-effort heading lines."""
-    text = "\n\n".join(pdf_pages(data))
-    sections = [line.strip() for line in text.splitlines() if _PDF_HEADING.fullmatch(line.strip())]
-    return text.strip() + "\n", sections
 
 
 async def _fetch(http, url):
@@ -680,184 +734,83 @@ async def _fetch(http, url):
     return None
 
 
-def _caption(line):
-    """(label, score) when the line can start a caption, else None.
-
-    Score 3: a ':' or '|' separator, or an all-caps label ("FIGURE 2"); 2: a '.' separator or the
-    label alone on its line; 1: a capitalized word after the label ("Figure 1 Flow diagram").
-    """
-    m = _CAPTION.match(line.strip())
-    if m is None:
-        return None
-    word, rest = m.group(1), m.group(3)
-    label = f"{'Table' if word.upper() == 'TABLE' else 'Figure'} {m.group(2)}"
-    if rest[:1] in (":", "|") or (word.isupper() and rest[:1] in ("", " ", ".", ":", "|")):
-        return label, 3
-    if rest[:1] == "." or not rest.strip():
-        return label, 2
-    if rest[:1] == " " and rest.strip()[:1].isupper():
-        return label, 1
-    return None
-
-
-def _best_captions(lines):
-    """For each label, the index of its highest-scoring caption line (earliest on ties)."""
-    best = {}
-    for i, line in enumerate(lines):
-        found = _caption(line)
-        if found and found[1] > best.get(found[0], (0, None))[0]:
-            best[found[0]] = (found[1], i)
-    return best
-
-
-def find_figures(pages):
-    """Figure and table captions in PDF page texts as [{label, caption, page}], in page order."""
-    lines = [(number, line) for number, text in enumerate(pages, 1) for line in text.splitlines()]
-    figures = []
-    for label, (_, i) in sorted(_best_captions([line for _, line in lines]).items(), key=lambda kv: kv[1][1]):
-        caption = " ".join(" ".join(line for _, line in lines[i : i + 6]).split())[:200]
-        figures.append({"label": label, "caption": caption, "page": lines[i][0]})
-    return figures
-
-
-def mark_captions(text, figures):
-    """Prefix each figure's best caption line in text with '[Figure N, PDF page P]'.
-
-    Labels that already carry a marker are left as they are.
-    """
-    lines = text.splitlines()
-    pages = {f["label"]: f["page"] for f in figures}
-    for line in lines:
-        marked = _CAPTION_MARK.match(line)
-        if marked:
-            pages.pop(marked.group(1), None)
-    for label, (_, i) in _best_captions(lines).items():
-        if label in pages:
-            lines[i] = f"[{label}, PDF page {pages[label]}] {lines[i]}"
-    return "\n".join(lines) + "\n"
-
-
-async def _fetch_pdf(http, url):
-    r = await _fetch(http, url)
-    return r.content if r is not None and r.content.startswith(b"%PDF") else None
-
-
-async def fetch_full_text(http, paper):
-    """Return (text, sections, source, pdf).
-
-    Text comes from arXiv HTML, else the arXiv PDF, else the open-access PDF.
-    pdf is the paper's PDF bytes (arXiv first, then open access), or None.
-    """
-    text, sections, source, pdf = None, [], None, None
+async def save_pdf(http, paper: Paper):
+    """Path of the paper's saved PDF (arXiv first, then open access), or None when neither exists."""
+    path = _cache_dir() / str(paper["paperId"]) / "paper.pdf"
+    if path.exists():
+        return path
     arxiv_id = (paper.get("externalIds") or {}).get("ArXiv")
-    if arxiv_id:
-        r = await _fetch(http, f"https://arxiv.org/html/{arxiv_id}")
-        if r is not None and 'class="ltx_document' in r.text:
-            text, sections = html_to_text(r.text)
-            source = "arxiv-html"
-        pdf = await _fetch_pdf(http, f"https://arxiv.org/pdf/{arxiv_id}")
-        if text is None and pdf is not None:
-            text, sections = pdf_to_text(pdf)
-            source = "arxiv-pdf"
     oa_url = (paper.get("openAccessPdf") or {}).get("url")
-    if pdf is None and oa_url:
-        pdf = await _fetch_pdf(http, oa_url)
-        if text is None and pdf is not None:
-            text, sections = pdf_to_text(pdf)
-            source = "open-access-pdf"
-    return text, sections, source, pdf
-
-
-async def cached_full_text(http, paper):
-    """fetch_full_text through the per-user cache: <paperId>.txt, .pdf and a .json sidecar.
-
-    Returns a dict with path, sections, source, pdfPath and figures.
-    """
-    cache = _cache_dir()
-    text_path, pdf_path, meta_path = (cache / f"{paper['paperId']}{ext}" for ext in (".txt", ".pdf", ".json"))
-    if text_path.exists() and meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        if "figures" in meta:
-            return {
-                "path": str(text_path),
-                "sections": meta["sections"],
-                "source": meta["source"],
-                "pdfPath": str(pdf_path) if pdf_path.exists() else None,
-                "figures": meta["figures"],
-            }
-    text, sections, source, pdf = await fetch_full_text(http, paper)
-    if text is None:
-        return {"path": None, "sections": [], "source": None, "pdfPath": None, "figures": []}
-    figures = []
-    if pdf is not None:
-        try:
-            figures = find_figures(pdf_pages(pdf))
-        except PyPdfError:
-            pass
-    cache.mkdir(parents=True, exist_ok=True)
-    text_path.write_text(mark_captions(text, figures))
-    if pdf is not None:
-        pdf_path.write_bytes(pdf)
-    meta_path.write_text(json.dumps({"sections": sections, "source": source, "figures": figures}))
-    return {
-        "path": str(text_path),
-        "sections": sections,
-        "source": source,
-        "pdfPath": str(pdf_path) if pdf is not None else None,
-        "figures": figures,
-    }
+    for url in ([f"https://arxiv.org/pdf/{arxiv_id}"] if arxiv_id else []) + ([oa_url] if oa_url else []):
+        r = await _fetch(http, url)
+        if r is not None and r.content.startswith(b"%PDF"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(r.content)
+            return path
+    return None
 
 
 async def _count(results, cap):
     count = 0
-    if results is not None:
-        async for _ in results:
-            count += 1
-            if count >= cap:
-                break
+    async for _ in results:
+        count += 1
+        if count >= cap:
+            break
     return count
 
 
-async def read_paper(client, http, paper, refs, year):
-    full = await cached_full_text(http, paper)
-    if full["source"] is None:
+async def read_paper(client, http, paper: Paper, year):
+    pdf = await save_pdf(http, paper)
+    if pdf is None:
         print(
-            f"error: {paper['paperId']}: no full text found (no arXiv HTML/PDF or open-access PDF); "
+            f"error: {paper['paperId']}: no PDF found (no arXiv or open-access PDF); "
             f"try a web search for the title: {paper.get('title')!r}",
             file=sys.stderr,
         )
-    elif full["pdfPath"] is None:
-        print(f"warning: {paper['paperId']}: no PDF found, so figures are unavailable", file=sys.stderr)
-    references = []
-    if refs:
-        results = await client.get_paper_references(paper["paperId"], fields=REF_FIELDS, limit=min(refs, 1000))
-        if results is not None:
-            async for item in results:
-                cited = (_extract_citation(item) or {}).get("citedPaper") or {}
-                if cited.get("paperId"):
-                    references.append({k: cited.get(k) for k in REF_FIELDS})
-                if len(references) >= refs:
-                    break
     in_range = None
     if year:
         results = await client.get_paper_citations(
             paper["paperId"], fields=["paperId"], limit=1000, publication_date_or_year=year.replace("-", ":")
         )
-        # limit is the page size; pages continue until the API's 9999-result window ends.
+        # limit is the page size; pages continue until the endpoint's 9999-result window ends.
         in_range = await _count(results, 9999)
     return {
         "paperId": paper["paperId"],
         "title": paper.get("title"),
         "year": paper.get("year"),
-        "fullTextPath": full["path"],
-        "fullTextSource": full["source"],
-        "sections": full["sections"],
-        "pdfPath": full["pdfPath"],
-        "figures": full["figures"],
-        "references": references,
+        "pdfPath": str(pdf) if pdf else None,
         "citationCount": paper.get("citationCount"),
         "citationsInRange": in_range,
     }
+
+
+def _with_note(result):
+    """The read result with its reading note: the reminder when a PDF was saved, else None."""
+    return {**result, "note": READ_NOTE if result.get("pdfPath") else None}
+
+
+def _read_cache_path(paper_id, year):
+    """Cache file of a read of paper_id (as given on the command line) with year."""
+    key = hashlib.sha256(f"{paper_id}\n{year or ''}".encode()).hexdigest()
+    return _cache_dir() / "reads" / f"{key}.json"
+
+
+def _cached_read(paper_id, year):
+    """The saved output of a read made within READ_CACHE_SECONDS whose PDF still exists, or None."""
+    path = _read_cache_path(paper_id, year)
+    try:
+        saved = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+    if time.time() - saved.get("savedAt", 0) > READ_CACHE_SECONDS or not Path(saved["result"]["pdfPath"]).exists():
+        return None
+    return saved["result"]
+
+
+def _save_read(paper_id, year, result):
+    path = _read_cache_path(paper_id, year)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"savedAt": time.time(), "result": result}))
 
 
 def _http_client():
@@ -865,15 +818,24 @@ def _http_client():
 
 
 async def cmd_read(args):
-    client = make_client()
     ids = read_ids(args.ids, sys.stdin)
     if not ids:
         print("error: no paper IDs provided", file=sys.stderr)
         sys.exit(0)
+    pending = []
+    for paper_id in ids:
+        cached = _cached_read(paper_id, args.year)
+        if cached is not None:
+            output(_with_note(cached))
+        else:
+            pending.append(paper_id)
+    if not pending:
+        return
+    client = make_client()
     async with _http_client() as http:
-        for i in range(0, len(ids), 500):
-            chunk = ids[i : i + 500]
-            papers, not_found = await client.get_papers(chunk, fields=READ_FIELDS, return_not_found=True)
+        for i in range(0, len(pending), 500):
+            chunk = pending[i : i + 500]
+            papers, not_found = await client.get_papers(chunk, fields=READ_FIELDS)
             if not_found:
                 print(f"error: not found: {', '.join(not_found)}", file=sys.stderr)
             elif not_found is None:
@@ -882,11 +844,20 @@ async def cmd_read(args):
                     f"cannot tell which resolved): {', '.join(chunk)}",
                     file=sys.stderr,
                 )
-            for paper in papers:
+            # The batch answers in input order, so found IDs pair with papers when the counts agree;
+            # otherwise results are output but not cached.
+            found = [pid for pid in chunk if not_found is not None and pid not in not_found]
+            if len(found) != len(papers):
+                found = [None] * len(papers)
+            for paper_id, paper in zip(found, papers, strict=True):
                 try:
-                    output(await read_paper(client, http, paper.raw_data, args.refs, args.year))
+                    result = await read_paper(client, http, paper, args.year)
                 except Exception as exc:
-                    print(f"error: {paper.raw_data.get('paperId')}: {_describe_error(exc)}", file=sys.stderr)
+                    print(f"error: {paper.get('paperId')}: {_describe_error(exc)}", file=sys.stderr)
+                    continue
+                output(_with_note(result))
+                if paper_id is not None and result["pdfPath"] is not None:
+                    _save_read(paper_id, args.year, result)
 
 
 async def cmd_fields(_args):
@@ -938,7 +909,7 @@ def main():
     )
     p.add_argument("query", help="search query string")
     p.add_argument("-f", "--fields", help=f"comma-separated fields (default: {scan_default})")
-    p.add_argument("-n", "--limit", type=int, default=10, help="max results (default: 10, max: 1000)")
+    p.add_argument("-n", "--limit", type=int, help="max results (default: all, up to 1000)")
     p.add_argument("-y", "--year", type=year_range, help="publication year or range: 2020, 2018-2020, 2018- (from), -2015 (until)")
     p.add_argument(
         "-d",
@@ -986,36 +957,23 @@ def main():
 
     p = sub.add_parser(
         "read",
-        help="Save a paper's full text and PDF, with its figures and references",
+        help="Save a paper's PDF to read with the Read tool, first page to last",
         description=(
-            "Save each paper's full text as a plain-text file and its PDF, and describe the\n"
-            "paper: section headings, figures and tables with their PDF pages, references as\n"
-            "S2 IDs, and with -y how many papers cite it in a year range."
+            "Save each paper's PDF to a local file and print its path as pdfPath. Read that\n"
+            "PDF with the Read tool from the first page to the last before reporting on the\n"
+            "paper. With -y, also count the papers that cite it in a year range."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "output: JSON lines, one object per paper:\n"
             "          paperId, title, year, citationCount\n"
-            "          fullTextPath     the plain-text paper; each figure or table caption starts\n"
-            "                           with '[Figure N, PDF page P]'\n"
-            "          fullTextSource   arxiv-html, arxiv-pdf, open-access-pdf, or null\n"
-            "          sections         section headings (complete from HTML, partial or empty\n"
-            "                           from a PDF)\n"
-            "          pdfPath          the saved PDF, or null\n"
-            "          figures          {label, caption, page} per figure and table; page is the\n"
-            "                           1-indexed PDF page\n"
-            "          references       {paperId, title, year} per cited paper\n"
+            "          pdfPath          the saved PDF, or null when the paper has no PDF\n"
             "          citationsInRange citing papers in the -y range (null without -y; counted\n"
             "                           up to 9999)\n"
-            "reading: the text file holds the words, tables as text and math as LaTeX. Plots and\n"
-            "        diagrams exist only as images in the PDF: reading pdfPath with pages=P shows\n"
-            "        page P as an image\n"
-            "sources: text from arXiv HTML, else the arXiv PDF, else the S2 open-access PDF; the\n"
-            "        PDF from arXiv, else the open-access PDF. Without full text, fullTextSource is\n"
-            "        null and stderr names the title to search the web for; without a PDF, stderr\n"
-            "        says figures are unavailable\n"
-            "cache:  files are kept in $TMPDIR/s2-papers/ (or $S2_CACHE_DIR) and reused; delete a\n"
-            "        paper's .txt/.pdf/.json there to refetch it\n"
+            "          note             reminder to read pdfPath from the first page to the last\n"
+            "                           before reporting on the paper (null when there is no PDF)\n"
+            "reading: a paper counts as read once pdfPath has been read with the Read tool from\n"
+            "        the first page to the last\n"
             f"ids:    {ID_FORMS}\n"
             "stdin:  reads IDs from piped input when -i is omitted, e.g. from search or citations"
         ),
@@ -1027,9 +985,6 @@ def main():
         type=year_range,
         help="count citing papers in this year or range: 2026, 2018-2020, 2018-, -2015 "
         "(same filter as citations -y)",
-    )
-    p.add_argument(
-        "--refs", type=int, default=50, help="max references listed per paper (default: 50, 0 = none)"
     )
 
     p = sub.add_parser(
@@ -1049,7 +1004,7 @@ def main():
     p.add_argument("-i", "--ids", nargs="+", metavar="ID", help="paper IDs to get citations for")
     p.add_argument("-f", "--fields", help=f"comma-separated fields (default: {scan_default})")
     p.add_argument(
-        "-n", "--limit", type=int, default=10, help="max citations per input paper (default: 10, max: 9999)"
+        "-n", "--limit", type=int, help="max citations per input paper (default: all, up to 9999)"
     )
     p.add_argument(
         "-y",
@@ -1077,7 +1032,7 @@ def main():
     p.add_argument("-i", "--ids", nargs="+", metavar="ID", help="paper IDs to get references for")
     p.add_argument("-f", "--fields", help=f"comma-separated fields (default: {scan_default})")
     p.add_argument(
-        "-n", "--limit", type=int, default=10, help="max references per input paper (default: 10, max: 9999)"
+        "-n", "--limit", type=int, help="max references per input paper (default: all, up to 9999)"
     )
 
     p = sub.add_parser(
@@ -1097,7 +1052,7 @@ def main():
     )
     p.add_argument("-i", "--ids", nargs="+", metavar="ID", help="seed paper IDs (positive examples)")
     p.add_argument("-f", "--fields", help=f"comma-separated fields (default: {scan_default})")
-    p.add_argument("-n", "--limit", type=int, default=10, help="max recommendations (default: 10, max: 500)")
+    p.add_argument("-n", "--limit", type=int, help="max recommendations (default: all, up to 500)")
     p.add_argument(
         "-x",
         "--negative-ids",
@@ -1127,7 +1082,7 @@ def main():
     )
     p.add_argument("query", help="author name search string")
     p.add_argument("-f", "--fields", help=f"comma-separated author fields (default: {author_scan_default})")
-    p.add_argument("-n", "--limit", type=int, default=10, help="max results (default: 10, max: 1000)")
+    p.add_argument("-n", "--limit", type=int, help="max results (default: all, up to 9999)")
 
     p = sub.add_parser(
         "author-papers",
@@ -1145,7 +1100,7 @@ def main():
     )
     p.add_argument("-i", "--ids", nargs="+", metavar="ID", help="S2 author IDs (authorId)")
     p.add_argument("-f", "--fields", help=f"comma-separated paper fields (default: {scan_default})")
-    p.add_argument("-n", "--limit", type=int, default=10, help="max papers per author (default: 10, max: 9999)")
+    p.add_argument("-n", "--limit", type=int, help="max papers per author (default: all, up to 9999)")
 
     sub.add_parser(
         "fields",
@@ -1179,11 +1134,12 @@ def main():
     try:
         asyncio.run(handlers[args.command](args))
     except BadQueryParametersException as e:
-        print(f"error: {e} (run 's2 fields' for valid field names)", file=sys.stderr)
+        tip = " (run 's2 fields' for valid field names)" if "field" in str(e).lower() else ""
+        print(f"error: {e}{tip}", file=sys.stderr)
     except ObjectNotFoundException as e:
         print(f"error: {e}", file=sys.stderr)
-    except PermissionError:
-        print("error: forbidden — check your S2_API_KEY", file=sys.stderr)
+    except PermissionError as e:
+        print(f"error: forbidden ({e}) — check your S2_API_KEY", file=sys.stderr)
     except RetryError as e:
         last = e.last_attempt.exception()
         if isinstance(last, ServerErrorException):
