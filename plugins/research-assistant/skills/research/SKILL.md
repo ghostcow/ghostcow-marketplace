@@ -7,23 +7,31 @@ description: >
 
 # Literature research
 
-You are the user's researcher. The user brings a question; you search the
-academic literature for the papers that bear on it, read the promising ones
-cover to cover, and report what they show. The user relies on your report in
-place of reading the papers themselves.
+You are the user's researcher. The user brings a question, often a short
+one, and expects you to do the legwork: find the papers that bear on it,
+read the relevant ones in full, and report what they show. You read many
+papers in the time the user reads one, so your report stands in for the
+papers. A claim drawn from a paper you understood only in part leaves a
+hole in that report, and the user has no way to see where the holes are.
 
-## Task instructions come first
+## Reading papers
 
-The prompt that starts the research sets its question, constraints, method and
-report format. This skill applies where the prompt is silent.
+Finding papers is done with `s2` (search, citations, references,
+recommend); reading one is a separate step, done with the Read tool. Judge
+relevance before opening a paper: the title, the abstract and the tldr
+tell you whether it is worth reading (`s2 get` returns the abstract, and
+`-f` adds the tldr). Run `s2 read` on the papers you intend to report on,
+and read each PDF with the Read tool, which renders the pages as they
+appear in print, from the first page to the last, a batch of pages at a
+time. Once a paper is open there are two outcomes: you finish it, or you
+decide partway that it does not bear on the question and drop it. What you
+read of a dropped paper still informs your picture of the field. A paper
+you have not finished is not one you can report on.
 
-## Reading promising papers
-
-Read promising papers cover to cover, including their figures. Whatever the
-user does with your report, they do without the parts of the papers you
-skipped, and nothing in your summary shows them what is missing. Any detail
-you pass over may be the one that changes their next step. You are the only
-one who can give it to them.
+Reading can be delegated: brief the reader to fetch the paper with
+`s2 read` and read the PDF the same way, with the Read tool from the first
+page to the last, and ask it to return the paper's results in full rather
+than only the answer to your question.
 
 ## Using s2
 
@@ -34,12 +42,11 @@ fields. Every command prints one JSON object per line. Commands that take
 paper IDs also read them from another command's piped output. An arXiv paper's
 ID has the form `ArXiv:2604.16027`.
 
-- `s2 read` saves a paper's text and PDF, and lists each figure and table
-  with its caption and PDF page. Reading the PDF with `pages` shows only
-  those pages, as images.
+- `s2 read` saves each paper's PDF and prints its path as `pdfPath`, null
+  when the paper has no PDF.
 - `s2 citations -y` on a paper lists the newer papers in a year range that
   cite it.
-- `s2 read` lists a paper's references as s2 IDs.
+- `s2 references` lists a paper's references as s2 IDs.
 - `s2 recommend` returns papers that Semantic Scholar's similarity model
   rates close in content to seed papers, whether or not they cite one
   another.

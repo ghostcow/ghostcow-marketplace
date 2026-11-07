@@ -3,7 +3,6 @@
 import argparse
 import os
 import sys
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,7 +19,7 @@ def make_args(**kwargs):
     """Build a namespace mimicking argparse output."""
     defaults = {
         "fields": None,
-        "limit": 10,
+        "limit": 10,  # tests pass limit=None to exercise the CLI default
         "ids": None,
         "command": "test",
         "year": None,
@@ -39,19 +38,22 @@ def make_args(**kwargs):
 
 
 def make_paper(data):
-    """Create a mock paper object with raw_data."""
-    return SimpleNamespace(raw_data=data)
+    """A paper as the client returns it: the API's JSON object."""
+    return data
 
 
-def make_citation(data, has_paper=True):
-    """Create a mock citation/reference with a nested paper object.
+def make_citation(data, has_paper=True, key="citingPaper"):
+    """A citation or reference edge as the API returns it.
 
-    When has_paper=True, the .paper attr is a SimpleNamespace (truthy, like a
-    real Paper).  When False, .paper is None (as when the API omits the nested
-    paper object).
+    The edge carries its nested paper under key (citingPaper for citations,
+    citedPaper for references) unless data already has one. has_paper=False
+    drops the nested paper, as the API does for removed papers.
     """
-    paper = SimpleNamespace(raw_data=data) if has_paper else None
-    return SimpleNamespace(paper=paper, raw_data=data)
+    if not has_paper:
+        return {k: v for k, v in data.items() if k not in ("citingPaper", "citedPaper")}
+    if "citingPaper" in data or "citedPaper" in data:
+        return data
+    return {**data, key: {}}
 
 
 def tty_stdin():

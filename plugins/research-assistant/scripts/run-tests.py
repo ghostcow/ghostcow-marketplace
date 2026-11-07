@@ -1,7 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "semanticscholar==0.11.0",
 #     "filelock==3.25.0",
 #     "httpx==0.28.1",
 #     "anyio==4.12.1",
@@ -9,8 +8,6 @@
 #     "h11==0.16.0",
 #     "httpcore==1.0.9",
 #     "idna==3.11",
-#     "nest-asyncio==1.6.0",
-#     "pypdf==6.21.4",
 #     "socksio==1.0.0",
 #     "tenacity==9.1.4",
 #     "truststore==0.10.5",
