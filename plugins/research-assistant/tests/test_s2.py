@@ -26,7 +26,7 @@ from s2 import (
     PAGED_WINDOW,
     SEARCH_WINDOW,
     READ_CACHE_SECONDS,
-    READ_NOTE,
+    READ_NOTES,
     RateLimitedError,
     S2APIError,
     S2Client,
@@ -1660,11 +1660,11 @@ class TestCmdRead:
         self.cache = tmp_path
         self.converted = []
 
-        def fake_pdf_to_markdown(pdf_path, figures_dir):
+        def fake_pdf_to_search_text(pdf_path):
             self.converted.append(Path(pdf_path))
-            return "converted from the PDF\n"
+            return "extracted from the PDF\n"
 
-        monkeypatch.setattr("s2.pdf_to_markdown", fake_pdf_to_markdown)
+        monkeypatch.setattr("s2.pdf_to_search_text", fake_pdf_to_search_text)
 
     def _setup(self, mock_client, paper=ARXIV_PAPER, not_found=()):
         mock_client.get_papers.return_value = ([make_paper(paper)], list(not_found))
@@ -1681,7 +1681,10 @@ class TestCmdRead:
         out = json.loads(capsys.readouterr().out)
         assert Path(out["pdfPath"]) == self.cache / "p1" / "paper.pdf"
         assert Path(out["pdfPath"]).read_bytes() == b"%PDF-1.7 body"
-        assert set(out) == {"paperId", "title", "year", "pdfPath", "textPath", "citationCount", "citationsInRange", "note"}
+        assert set(out) == {
+            "paperId", "title", "year", "pdfPath", "textPath", "searchTextPath",
+            "citationCount", "citationsInRange", "note",
+        }
 
     @pytest.mark.asyncio
     async def test_text_from_arxiv_html(self, mock_client, capsys):
@@ -1692,15 +1695,35 @@ class TestCmdRead:
         text = Path(out["textPath"]).read_text()
         assert "$x^2$" in text and f"![]({self.cache / 'p1' / 'figures' / 'fig001.png'})" in text
         assert (self.cache / "p1" / "figures" / "fig001.png").read_bytes() == b"PNG"
-        assert self.converted == []
+        assert out["searchTextPath"] is None and self.converted == []
+        assert out["note"] == READ_NOTES["both"]
 
     @pytest.mark.asyncio
-    async def test_text_from_pdf_without_arxiv_html(self, mock_client, capsys):
+    async def test_identical_images_share_one_file(self, mock_client, capsys):
+        self._setup(mock_client)
+        html = ARXIV_HTML.replace(b"</figure>", b'<img src="2604.00001v1/again.png"></figure>')
+        routes = {
+            **ARXIV_PDF,
+            ARXIV_HTML_URL: (200, html),
+            "https://arxiv.org/html/2604.00001v1/plot.png": (200, b"PNG"),
+            "https://arxiv.org/html/2604.00001v1/again.png": (200, b"PNG"),
+        }
+        await self._read(routes)
+        text = Path(json.loads(capsys.readouterr().out)["textPath"]).read_text()
+        figures = self.cache / "p1" / "figures"
+        assert text.count(f"![]({figures / 'fig001.png'})") == 2
+        assert sorted(f.name for f in figures.iterdir()) == ["fig001.png"]
+
+    @pytest.mark.asyncio
+    async def test_search_text_from_pdf_without_arxiv_html(self, mock_client, capsys):
         self._setup(mock_client)
         await self._read(ARXIV_PDF)
         out = json.loads(capsys.readouterr().out)
-        assert Path(out["textPath"]).read_text() == "converted from the PDF\n"
+        assert out["textPath"] is None
+        assert Path(out["searchTextPath"]).read_text() == "extracted from the PDF\n"
         assert self.converted == [self.cache / "p1" / "paper.pdf"]
+        assert out["note"] == READ_NOTES["pdf+search"]
+        assert "pdfPath" in out["note"] and "searchTextPath" in out["note"] and "textPath " not in out["note"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1715,28 +1738,31 @@ class TestCmdRead:
         self._setup(mock_client)
         await self._read({**ARXIV_PDF, ARXIV_HTML_URL: (200, html)})
         out = json.loads(capsys.readouterr().out)
-        assert Path(out["textPath"]).read_text() == "converted from the PDF\n"
-        assert not (self.cache / "p1" / "figures" / "fig001.png").exists()
+        assert out["textPath"] is None
+        assert Path(out["searchTextPath"]).read_text() == "extracted from the PDF\n"
+        assert not (self.cache / "p1" / "figures").exists()
 
     @pytest.mark.asyncio
     async def test_failed_conversion_reported(self, mock_client, capsys, monkeypatch):
         self._setup(mock_client)
 
-        def broken(pdf_path, figures_dir):
+        def broken(pdf_path):
             raise RuntimeError("damaged xref table")
 
-        monkeypatch.setattr("s2.pdf_to_markdown", broken)
+        monkeypatch.setattr("s2.pdf_to_search_text", broken)
         await self._read(ARXIV_PDF)
         captured = capsys.readouterr()
         out = json.loads(captured.out)
-        assert out["textPath"] is None and out["pdfPath"] is not None
-        assert "p1: the PDF could not be converted to text: damaged xref table" in captured.err
+        assert out["textPath"] is None and out["searchTextPath"] is None and out["pdfPath"] is not None
+        assert out["note"] == READ_NOTES["pdf"]
+        assert "p1: no search text could be extracted from the PDF: damaged xref table" in captured.err
 
     @pytest.mark.asyncio
     async def test_no_text_without_pdf_or_html(self, mock_client, capsys):
         self._setup(mock_client, paper={"paperId": "p9", "title": "Lost", "externalIds": {}})
         await self._read({})
-        assert json.loads(capsys.readouterr().out)["textPath"] is None
+        out = json.loads(capsys.readouterr().out)
+        assert out["textPath"] is None and out["searchTextPath"] is None
 
     @pytest.mark.asyncio
     async def test_note_tells_reader_to_read_cover_to_cover(self, mock_client, capsys):
@@ -1744,8 +1770,18 @@ class TestCmdRead:
         await self._read(ARXIV_PDF)  # fresh read
         await self._read(ARXIV_PDF)  # served from the cache
         fresh, cached = (json.loads(line) for line in capsys.readouterr().out.splitlines())
-        assert fresh["note"] == cached["note"] == READ_NOTE
-        assert "cover to cover" in READ_NOTE and "pdfPath" in READ_NOTE and "textPath" in READ_NOTE
+        assert fresh["note"] == cached["note"] == READ_NOTES["pdf+search"]
+        assert all("cover to cover" in note for note in READ_NOTES.values())
+
+    @pytest.mark.asyncio
+    async def test_note_names_text_when_only_html_was_saved(self, mock_client, capsys):
+        paper = {"paperId": "p1", "title": "No PDF", "externalIds": {"ArXiv": "2604.00001"}}
+        self._setup(mock_client, paper=paper)
+        routes = {ARXIV_HTML_URL: (200, ARXIV_HTML), "https://arxiv.org/html/2604.00001v1/plot.png": (200, b"PNG")}
+        await self._read(routes)
+        out = json.loads(capsys.readouterr().out)
+        assert out["pdfPath"] is None and out["textPath"] is not None
+        assert out["note"] == READ_NOTES["text"]
 
     @pytest.mark.asyncio
     async def test_note_is_null_when_neither_copy_was_saved(self, mock_client, capsys):

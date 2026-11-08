@@ -731,11 +731,16 @@ async def cmd_author_papers(args):
 
 
 READ_FIELDS = ["paperId", "title", "year", "externalIds", "openAccessPdf", "citationCount"]
-# Printed with every saved PDF so the reminder travels with the paper it applies to.
-READ_NOTE = (
-    "To report on this paper, read it cover to cover from either copy: "
-    "pdfPath with the Read tool, or textPath with its linked figure images."
-)
+# Printed with every read so the reminder travels with the paper it applies to; it names the
+# copies that hold the whole paper.
+READ_NOTES = {
+    "both": "To report on this paper, read it cover to cover from either copy: "
+    "pdfPath with the Read tool, or textPath with its linked figure images.",
+    "pdf": "To report on this paper, read pdfPath cover to cover with the Read tool.",
+    "pdf+search": "To report on this paper, read pdfPath cover to cover with the Read tool. "
+    "searchTextPath is text extracted from the PDF for searching; it is incomplete and not a copy to read from.",
+    "text": "To report on this paper, read textPath cover to cover with its linked figure images.",
+}
 FETCH_HEADERS = {"User-Agent": "s2-cli/1.0 (research-assistant plugin; full-text reader)"}
 FETCH_TIMEOUT = 60
 FETCH_ATTEMPTS = 3
@@ -752,6 +757,9 @@ _TABLE_TAGS = {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
 _EQUATION_TABLE_CLASSES = {"ltx_equation", "ltx_equationgroup", "ltx_eqn_table", "ltx_eqn_align"}
 # Image formats the Read tool shows to the model as images.
 _RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+# File names in a paper's cache directory.
+TEXT_FILE = "text.md"
+SEARCH_TEXT_FILE = "search.md"
 
 
 def _cache_dir():
@@ -971,17 +979,15 @@ def svg_to_png(svg):
     return bytes(surface.makeImageSnapshot().encodeToData())
 
 
-def pdf_to_markdown(pdf_path, figures_dir):
-    """Markdown of a PDF, with page-end markers and its figures and formulas as image files in figures_dir."""
+def pdf_to_search_text(pdf_path):
+    """Text extracted from a PDF for searching, with page-end markers; figures and formulas are not kept."""
     import pymupdf
     import pymupdf4llm
 
-    figures_dir.mkdir(parents=True, exist_ok=True)
     with pymupdf.open(pdf_path) as doc:
         markdown = pymupdf4llm.to_markdown(
             doc,
-            write_images=True,
-            image_path=str(figures_dir),
+            write_images=False,
             page_separators=True,
             use_ocr=False,
             header=False,
@@ -1030,7 +1036,11 @@ async def save_pdf(http, paper: Paper):
 
 
 async def _save_images(http, images, figures_dir):
-    """Save every image of the page as a file the Read tool shows as an image; True when all were saved."""
+    """Save the page's images as files the Read tool shows as images, or None when one cannot be saved.
+
+    Returns {link: replacement} for the links the Markdown should change: an
+    image identical to an earlier one links to that earlier file.
+    """
     figures_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(IMAGE_CONNECTIONS)
 
@@ -1044,19 +1054,31 @@ async def _save_images(http, images, figures_dir):
         return r.content if r is not None else None
 
     async def save(name, source):
+        """(file name, content) of the image as saved, or None."""
         content = await load(source)
         if content is None:
-            return False
+            return None
         if Path(name).suffix in _RASTER_SUFFIXES:
-            (figures_dir / name).write_bytes(content)
-            return True
+            return name, content
         try:
-            (figures_dir / f"{name}.png").write_bytes(await asyncio.to_thread(svg_to_png, content))
+            return f"{name}.png", await asyncio.to_thread(svg_to_png, content)
         except ValueError:
-            return False
-        return True
+            return None
 
-    return all(await asyncio.gather(*(save(name, source) for name, source in images)))
+    saved = await asyncio.gather(*(save(name, source) for name, source in images))
+    if any(item is None for item in saved):
+        return None
+    replacements = {}
+    first_with = {}
+    for file_name, content in saved:
+        link = f"![]({figures_dir / file_name})"
+        digest = hashlib.sha256(content).hexdigest()
+        if digest in first_with:
+            replacements[link] = f"![]({figures_dir / first_with[digest]})"
+            continue
+        first_with[digest] = file_name
+        (figures_dir / file_name).write_bytes(content)
+    return replacements
 
 
 async def _arxiv_markdown(http, arxiv_id, figures_dir):
@@ -1069,35 +1091,47 @@ async def _arxiv_markdown(http, arxiv_id, figures_dir):
     if r is None or 'class="ltx_document' not in r.text or "ltx_ERROR" in r.text:
         return None
     markdown, images = html_to_markdown(r.text, str(r.url), figures_dir)
-    return markdown if await _save_images(http, images, figures_dir) else None
+    replacements = await _save_images(http, images, figures_dir)
+    if replacements is None:
+        return None
+    for link, replacement in replacements.items():
+        markdown = markdown.replace(link, replacement)
+    return markdown
 
 
 async def save_text(http, paper: Paper, pdf_task):
-    """Path of the paper as Markdown with its figures as image files, or None.
+    """(textPath, searchTextPath) of the paper; each is None when not saved.
 
-    The text comes from the arXiv HTML version when it is complete, else from
-    the PDF that pdf_task saves.
+    textPath is the paper's complete text as Markdown with its figures as image
+    files, from the arXiv HTML version when that is complete. Without it,
+    searchTextPath is text extracted from the PDF that pdf_task saves, for
+    searching only.
     """
     paper_dir = _cache_dir() / str(paper["paperId"])
-    path = paper_dir / "paper.md"
+    path = paper_dir / TEXT_FILE
+    search_path = paper_dir / SEARCH_TEXT_FILE
     if path.exists():
-        return path
+        return path, None
+    if search_path.exists():
+        return None, search_path
+    paper_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = paper_dir / "figures"
     arxiv_id = (paper.get("externalIds") or {}).get("ArXiv")
     markdown = await _arxiv_markdown(http, arxiv_id, figures_dir) if arxiv_id else None
-    pdf = await pdf_task if markdown is None else None
-    if markdown is None and pdf is not None:
-        shutil.rmtree(figures_dir, ignore_errors=True)
-        try:
-            markdown = await asyncio.to_thread(pdf_to_markdown, pdf, figures_dir)
-        except Exception as exc:
-            print(f"error: {paper['paperId']}: the PDF could not be converted to text: {exc}", file=sys.stderr)
-    if markdown is None:
-        shutil.rmtree(figures_dir, ignore_errors=True)
-        return None
-    paper_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(markdown)
-    return path
+    if markdown is not None:
+        path.write_text(markdown)
+        return path, None
+    shutil.rmtree(figures_dir, ignore_errors=True)
+    pdf = await pdf_task
+    if pdf is None:
+        return None, None
+    try:
+        search_text = await asyncio.to_thread(pdf_to_search_text, pdf)
+    except Exception as exc:
+        print(f"error: {paper['paperId']}: no search text could be extracted from the PDF: {exc}", file=sys.stderr)
+        return None, None
+    search_path.write_text(search_text)
+    return None, search_path
 
 
 async def _count(results, cap):
@@ -1113,7 +1147,7 @@ async def read_paper(client, http, paper: Paper, year):
     # The PDF downloads while the text is prepared, which needs the PDF only when there is no arXiv HTML.
     pdf_task = asyncio.ensure_future(save_pdf(http, paper))
     try:
-        text = await save_text(http, paper, pdf_task)
+        text, search_text = await save_text(http, paper, pdf_task)
     finally:
         pdf = await pdf_task
     if pdf is None:
@@ -1135,14 +1169,24 @@ async def read_paper(client, http, paper: Paper, year):
         "year": paper.get("year"),
         "pdfPath": str(pdf) if pdf else None,
         "textPath": str(text) if text else None,
+        "searchTextPath": str(search_text) if search_text else None,
         "citationCount": paper.get("citationCount"),
         "citationsInRange": in_range,
     }
 
 
 def _with_note(result):
-    """The read result with its reading note: the reminder when a copy was saved, else None."""
-    return {**result, "note": READ_NOTE if result.get("pdfPath") or result.get("textPath") else None}
+    """The read result with its reading note, which names the copies to read; None when neither was saved."""
+    pdf, text, search = result.get("pdfPath"), result.get("textPath"), result.get("searchTextPath")
+    if pdf and text:
+        note = READ_NOTES["both"]
+    elif pdf:
+        note = READ_NOTES["pdf+search" if search else "pdf"]
+    elif text:
+        note = READ_NOTES["text"]
+    else:
+        note = None
+    return {**result, "note": note}
 
 
 def _read_cache_path(paper_id, year):
@@ -1159,9 +1203,9 @@ def _cached_read(paper_id, year):
     except (FileNotFoundError, ValueError):
         return None
     result = saved.get("result") or {}
-    if time.time() - saved.get("savedAt", 0) > READ_CACHE_SECONDS or "textPath" not in result:
+    if time.time() - saved.get("savedAt", 0) > READ_CACHE_SECONDS or "searchTextPath" not in result:
         return None
-    if not all(Path(result[key]).exists() for key in ("pdfPath", "textPath") if result[key]):
+    if not all(Path(result[key]).exists() for key in ("pdfPath", "textPath", "searchTextPath") if result[key]):
         return None
     return result
 
@@ -1318,26 +1362,33 @@ def main():
         "read",
         help="Save a paper as PDF and Markdown, to read in full",
         description=(
-            "Save each paper twice, for reading cover to cover before reporting on it: the\n"
-            "PDF, printed as pdfPath, which the Read tool renders page by page, and the full\n"
-            "text as Markdown, printed as textPath, with figures as image files the Read tool\n"
-            "shows as images. With -y, also count the papers that cite it in a year range."
+            "Save each paper for reading cover to cover before reporting on it: the PDF,\n"
+            "printed as pdfPath, which the Read tool renders page by page, and, from the arXiv\n"
+            "HTML version, the complete text as Markdown, printed as textPath, with figures as\n"
+            "image files the Read tool shows as images. Without that HTML version, text\n"
+            "extracted from the PDF is saved for searching, printed as searchTextPath. With -y,\n"
+            "also count the papers that cite it in a year range."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "output: JSON lines, one object per paper:\n"
             "          paperId, title, year, citationCount\n"
             "          pdfPath          the saved PDF, or null when the paper has no PDF\n"
-            "          textPath         the paper's full text as Markdown, from arXiv HTML when\n"
-            "                           it converts cleanly, else from the PDF; figures (and,\n"
-            "                           from the PDF, formulas) are image files linked in the\n"
-            "                           text; null when there is neither\n"
+            "          textPath         the paper's complete text as Markdown, from the arXiv\n"
+            "                           HTML version: formulas as LaTeX, figures as image files\n"
+            "                           linked in the text; null when there is no complete HTML\n"
+            "                           version\n"
+            "          searchTextPath   when textPath is null, text extracted from the PDF for\n"
+            "                           searching, with page-end markers that point into pdfPath;\n"
+            "                           incomplete (no figures or formulas), not a copy to read\n"
+            "                           from; else null\n"
             "          citationsInRange citing papers in the -y range (null without -y; counted\n"
             "                           up to 9999)\n"
-            "          note             reminder to read the paper cover to cover from either copy\n"
-            "                           before reporting on it (null when neither was saved)\n"
-            "reading: a paper counts as read once one copy has been read from the first page to\n"
-            "        the last: pdfPath with the Read tool, or textPath with its figure images\n"
+            "          note             reminder to read the paper cover to cover before reporting\n"
+            "                           on it, naming the copies to read (null when none was saved)\n"
+            "reading: a paper counts as read once a complete copy has been read from the first\n"
+            "        page to the last: pdfPath with the Read tool, or textPath with its figure\n"
+            "        images\n"
             f"ids:    {ID_FORMS}\n"
             "stdin:  reads IDs from piped input when -i is omitted, e.g. from search or citations"
         ),
