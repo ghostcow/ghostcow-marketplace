@@ -43,6 +43,7 @@ from s2 import (
     cmd_references,
     cmd_search,
     cmd_search_author,
+    html_to_markdown,
     main,
     make_client,
     read_ids,
@@ -1620,11 +1621,50 @@ class TestFetch:
         assert sleep.await_count == 2
 
 
+ARXIV_HTML_URL = "https://arxiv.org/html/2604.00001"
+ARXIV_HTML = (
+    '<html><body><nav>menu</nav><article class="ltx_document">'
+    "<h1>A Paper</h1><p>We minimise <math alttext=\"x^2\"></math>.</p>"
+    '<figure><img src="2604.00001v1/plot.png"><figcaption>Figure 1: A plot.</figcaption></figure>'
+    "</article></body></html>"
+).encode()
+
+
+class TestHtmlToMarkdown:
+    def test_keeps_math_figures_and_headings(self):
+        markdown, images = html_to_markdown(ARXIV_HTML.decode(), ARXIV_HTML_URL, Path("/c/p1/figures"))
+        assert "# A Paper" in markdown and "$x^2$" in markdown and "Figure 1: A plot." in markdown
+        assert "![](/c/p1/figures/fig001.png)" in markdown and "menu" not in markdown
+        assert images == [("fig001.png", "https://arxiv.org/html/2604.00001v1/plot.png")]
+
+    def test_svg_holding_html_text_becomes_text(self):
+        html = (
+            '<article><figure><svg width="10" height="10"><g><foreignObject>'
+            "<p>System prompt: answer in TSV.</p></foreignObject></g></svg></figure></article>"
+        )
+        markdown, images = html_to_markdown(html, ARXIV_HTML_URL, Path("/c/p1/figures"))
+        assert "System prompt: answer in TSV." in markdown
+        assert images == []
+
+    def test_svg_drawing_becomes_an_image(self):
+        html = '<article><figure><svg width="10" height="10"><path d="M0 0L5 5"/></svg></figure></article>'
+        markdown, images = html_to_markdown(html, ARXIV_HTML_URL, Path("/c/p1/figures"))
+        assert "![](/c/p1/figures/fig001.svg.png)" in markdown
+        assert images[0][0] == "fig001.svg" and images[0][1].startswith("<svg")
+
+
 class TestCmdRead:
     @pytest.fixture(autouse=True)
     def _cache(self, tmp_path, monkeypatch):
         monkeypatch.setenv("S2_CACHE_DIR", str(tmp_path))
         self.cache = tmp_path
+        self.converted = []
+
+        def fake_pdf_to_markdown(pdf_path, figures_dir):
+            self.converted.append(Path(pdf_path))
+            return "converted from the PDF\n"
+
+        monkeypatch.setattr("s2.pdf_to_markdown", fake_pdf_to_markdown)
 
     def _setup(self, mock_client, paper=ARXIV_PAPER, not_found=()):
         mock_client.get_papers.return_value = ([make_paper(paper)], list(not_found))
@@ -1641,19 +1681,74 @@ class TestCmdRead:
         out = json.loads(capsys.readouterr().out)
         assert Path(out["pdfPath"]) == self.cache / "p1" / "paper.pdf"
         assert Path(out["pdfPath"]).read_bytes() == b"%PDF-1.7 body"
-        assert set(out) == {"paperId", "title", "year", "pdfPath", "citationCount", "citationsInRange", "note"}
+        assert set(out) == {"paperId", "title", "year", "pdfPath", "textPath", "citationCount", "citationsInRange", "note"}
 
     @pytest.mark.asyncio
-    async def test_note_tells_reader_to_read_first_page_to_last(self, mock_client, capsys):
+    async def test_text_from_arxiv_html(self, mock_client, capsys):
+        self._setup(mock_client)
+        routes = {**ARXIV_PDF, ARXIV_HTML_URL: (200, ARXIV_HTML), "https://arxiv.org/html/2604.00001v1/plot.png": (200, b"PNG")}
+        await self._read(routes)
+        out = json.loads(capsys.readouterr().out)
+        text = Path(out["textPath"]).read_text()
+        assert "$x^2$" in text and f"![]({self.cache / 'p1' / 'figures' / 'fig001.png'})" in text
+        assert (self.cache / "p1" / "figures" / "fig001.png").read_bytes() == b"PNG"
+        assert self.converted == []
+
+    @pytest.mark.asyncio
+    async def test_text_from_pdf_without_arxiv_html(self, mock_client, capsys):
+        self._setup(mock_client)
+        await self._read(ARXIV_PDF)
+        out = json.loads(capsys.readouterr().out)
+        assert Path(out["textPath"]).read_text() == "converted from the PDF\n"
+        assert self.converted == [self.cache / "p1" / "paper.pdf"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "html",
+        [
+            ARXIV_HTML.replace(b"<h1>", b'<span class="ltx_ERROR">undefined</span><h1>'),  # conversion errors
+            b"<html>Conversion to HTML had a Fatal error</html>",  # not a converted paper
+            ARXIV_HTML,  # its figure cannot be downloaded
+        ],
+    )
+    async def test_incomplete_arxiv_html_falls_back_to_pdf(self, mock_client, capsys, html):
+        self._setup(mock_client)
+        await self._read({**ARXIV_PDF, ARXIV_HTML_URL: (200, html)})
+        out = json.loads(capsys.readouterr().out)
+        assert Path(out["textPath"]).read_text() == "converted from the PDF\n"
+        assert not (self.cache / "p1" / "figures" / "fig001.png").exists()
+
+    @pytest.mark.asyncio
+    async def test_failed_conversion_reported(self, mock_client, capsys, monkeypatch):
+        self._setup(mock_client)
+
+        def broken(pdf_path, figures_dir):
+            raise RuntimeError("damaged xref table")
+
+        monkeypatch.setattr("s2.pdf_to_markdown", broken)
+        await self._read(ARXIV_PDF)
+        captured = capsys.readouterr()
+        out = json.loads(captured.out)
+        assert out["textPath"] is None and out["pdfPath"] is not None
+        assert "p1: the PDF could not be converted to text: damaged xref table" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_no_text_without_pdf_or_html(self, mock_client, capsys):
+        self._setup(mock_client, paper={"paperId": "p9", "title": "Lost", "externalIds": {}})
+        await self._read({})
+        assert json.loads(capsys.readouterr().out)["textPath"] is None
+
+    @pytest.mark.asyncio
+    async def test_note_tells_reader_to_read_cover_to_cover(self, mock_client, capsys):
         self._setup(mock_client)
         await self._read(ARXIV_PDF)  # fresh read
         await self._read(ARXIV_PDF)  # served from the cache
         fresh, cached = (json.loads(line) for line in capsys.readouterr().out.splitlines())
         assert fresh["note"] == cached["note"] == READ_NOTE
-        assert "first page to the last" in READ_NOTE and "Read tool" in READ_NOTE
+        assert "cover to cover" in READ_NOTE and "pdfPath" in READ_NOTE and "textPath" in READ_NOTE
 
     @pytest.mark.asyncio
-    async def test_note_is_null_without_a_pdf(self, mock_client, capsys):
+    async def test_note_is_null_when_neither_copy_was_saved(self, mock_client, capsys):
         self._setup(mock_client, paper={"paperId": "p9", "title": "Lost", "externalIds": {}})
         await self._read({})
         assert json.loads(capsys.readouterr().out)["note"] is None

@@ -17,21 +17,21 @@ hole in that report, and the user has no way to see where the holes are.
 ## Reading papers
 
 Finding papers is done with `s2` (search, citations, references,
-recommend); reading one is a separate step, done with the Read tool. Judge
+recommend). Reading one is a separate step, done with the Read tool. Judge
 relevance before opening a paper: the title, the abstract and the tldr
 tell you whether it is worth reading (`s2 get` returns the abstract, and
-`-f` adds the tldr). Run `s2 read` on the papers you intend to report on,
-and read each PDF with the Read tool, which renders the pages as they
-appear in print, from the first page to the last, a batch of pages at a
-time. Once a paper is open there are two outcomes: you finish it, or you
-decide partway that it does not bear on the question and drop it. What you
-read of a dropped paper still informs your picture of the field. A paper
-you have not finished is not one you can report on.
+`-f` adds the tldr). Run `s2 read` on the papers you intend to report on.
+It saves two copies of each paper, and either is a reliable source: the
+PDF (`pdfPath`), which the Read tool renders as printed, and the full text
+as Markdown (`textPath`), with the figures as image files that the Read
+tool shows as images. Most of the time the user wants depth, and depth
+means that every paper you report on was read cover to cover. A paper you
+have not finished is not one you can report on.
 
 Reading can be delegated: brief the reader to fetch the paper with
-`s2 read` and read the PDF the same way, with the Read tool from the first
-page to the last, and ask it to return the paper's results in full rather
-than only the answer to your question.
+`s2 read` and read it the same way, cover to cover from either copy, and
+ask it to return the paper's results in full rather than only the answer
+to your question.
 
 ## Using s2
 
@@ -42,8 +42,9 @@ fields. Every command prints one JSON object per line. Commands that take
 paper IDs also read them from another command's piped output. An arXiv paper's
 ID has the form `ArXiv:2604.16027`.
 
-- `s2 read` saves each paper's PDF and prints its path as `pdfPath`, null
-  when the paper has no PDF.
+- `s2 read` saves each paper twice: the PDF as `pdfPath`, and the full
+  text as Markdown with its figures as image files as `textPath`. Either
+  is null when it could not be saved.
 - `s2 citations -y` on a paper lists the newer papers in a year range that
   cite it.
 - `s2 references` lists a paper's references as s2 IDs.

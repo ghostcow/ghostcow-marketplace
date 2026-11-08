@@ -13,7 +13,7 @@ A Claude Code plugin for academic research — finding papers, exploring citatio
 | `citations` | Get papers that cite a given paper |
 | `references` | Get papers cited by a given paper |
 | `recommend` | Recommend papers from seed paper(s) |
-| `read` | Save a paper's PDF to read with the Read tool, first page to last |
+| `read` | Save a paper as PDF and Markdown, to read in full |
 | `search-author` | Search authors by name |
 | `author-papers` | Get papers by author ID(s) |
 | `fields` | List all available field names for `-f` |
