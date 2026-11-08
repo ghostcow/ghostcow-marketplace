@@ -29,7 +29,7 @@ The mod sends the held messages on one of four events.
 | User message | When the user sends a message, the mod attaches all held messages to it as context. |
 | Esc | When the user interrupts the main turn, the mod keeps all held messages and attaches them to the user's next message. |
 
-After a release, that batch's later messages pass through unchanged. Slash commands release nothing, because a slash command may start no model turn. If Claude Code refuses the release submission, the messages go with the user's next message.
+After a release, that batch's later messages pass through unchanged. Slash commands release nothing, because a slash command may start no model turn. If Claude Code refuses the release submission, or refuses the user message that carries held messages, the messages go with the user's next message.
 
 The mod reads agent status every 2 seconds, because agent status changes raise no event a mod sees. An agent that Claude Code no longer lists counts as finished.
 

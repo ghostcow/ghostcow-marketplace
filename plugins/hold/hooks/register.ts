@@ -79,6 +79,15 @@ const release = ($: EngineInterface, texts: string[]) => {
   })
 }
 
+/**
+ * Puts messages taken for a user's message back as pending when that message
+ * did not enter, so they go with the user's next message.
+ */
+const restore = async ($: EngineInterface, texts: string[]) => {
+  await update($, hold, s => ({ ...s, pending: [...texts, ...s.pending] }))
+  await showStatus($)
+}
+
 type Arrival = { agentId: string; text: string; kind: 'handback' | 'notice' }
 
 /**
@@ -344,6 +353,12 @@ export const register: Register = on => {
       return next(e)
     }
 
-    return next({ ...e, context: [...(e.context ?? []), ...released] })
+    const result = await next({ ...e, context: [...(e.context ?? []), ...released] })
+
+    if (result.drop !== undefined) {
+      await restore($, released)
+    }
+
+    return result
   }).catch(($, e, next) => next(e))
 }
