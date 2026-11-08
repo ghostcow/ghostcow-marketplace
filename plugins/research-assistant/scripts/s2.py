@@ -8,6 +8,30 @@
 #     "h11==0.16.0",
 #     "httpcore==1.0.9",
 #     "idna==3.11",
+#     "pymupdf==2.1",
+#     "pymupdf4llm==2.1",
+#     "pymupdf-layout==2.1",
+#     "onnxruntime==1.31.1",
+#     "numpy==2.5.4",
+#     "networkx==3.7",
+#     "flatbuffers==25.12.19",
+#     "protobuf==7.36.2",
+#     "packaging==26.3",
+#     "psutil==7.2.2",
+#     "pdfplumber==0.11.10",
+#     "pdfminer.six==20260107",
+#     "pypdfium2==5.10.1",
+#     "pillow==12.2.0",
+#     "cffi==2.0.0",
+#     "cryptography==49.0.0",
+#     "pycparser==3.0",
+#     "charset-normalizer==3.4.7",
+#     "tabulate==0.10.0",
+#     "openpyxl==3.1.5",
+#     "et_xmlfile==2.0.0",
+#     "PyYAML==6.0.3",
+#     "skia-python==144.1",
+#     "pybind11==3.1.0",
 #     "socksio==1.0.0",
 #     "tenacity==9.1.4",
 #     "truststore==0.10.5",
@@ -17,17 +41,22 @@
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from functools import partial
+from html import escape
+from html.parser import HTMLParser
 from collections.abc import AsyncIterator
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 from typing import Any, Required, TypedDict
 
 import httpx
@@ -703,12 +732,26 @@ async def cmd_author_papers(args):
 
 READ_FIELDS = ["paperId", "title", "year", "externalIds", "openAccessPdf", "citationCount"]
 # Printed with every saved PDF so the reminder travels with the paper it applies to.
-READ_NOTE = "To report on this paper, read this PDF with the Read tool from the first page to the last."
+READ_NOTE = (
+    "To report on this paper, read it cover to cover from either copy: "
+    "pdfPath with the Read tool, or textPath with its linked figure images."
+)
 FETCH_HEADERS = {"User-Agent": "s2-cli/1.0 (research-assistant plugin; full-text reader)"}
 FETCH_TIMEOUT = 60
 FETCH_ATTEMPTS = 3
 # A read's output (metadata and citation counts included) is reused for this long.
 READ_CACHE_SECONDS = 24 * 60 * 60
+# Figure files of one paper are fetched together, the way a browser loads the page.
+IMAGE_CONNECTIONS = 8
+# SVG figures draw their text as glyph outlines, so they are rendered to PNG at this scale.
+SVG_SCALE = 2
+_SKIP_TAGS = {"script", "style", "nav", "header", "footer", "button", "noscript"}
+_BLOCK_TAGS = {"p", "div", "section", "figure", "figcaption", "blockquote", "pre", "dd", "dt", "br"}
+_HEADING_TAGS = {f"h{i}": i for i in range(1, 7)}
+_TABLE_TAGS = {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}
+_EQUATION_TABLE_CLASSES = {"ltx_equation", "ltx_equationgroup", "ltx_eqn_table", "ltx_eqn_align"}
+# Image formats the Read tool shows to the model as images.
+_RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
 def _cache_dir():
@@ -718,20 +761,256 @@ def _cache_dir():
     return Path(os.environ.get("TMPDIR", "/tmp")) / "s2-papers"
 
 
-async def _fetch(http, url):
-    """GET a non-S2 URL politely: retries on 429/5xx with backoff, None on failure."""
+class _HtmlMarkdown(HTMLParser):
+    """Markdown of an arXiv (LaTeXML) HTML paper that keeps all of its content.
+
+    Headings become '#' lines, math becomes its LaTeX source between $ or $$,
+    data tables stay HTML tables (cells, colspan and rowspan kept), links keep
+    their URL, and each figure image becomes a Markdown image of a file in
+    figures_dir. The images the page references are collected in `images` as
+    (file name, URL or inline SVG markup) for the caller to save. Only files
+    under the paper's own address count; others (arXiv's /static/ icons) are
+    page decoration. An SVG that holds HTML text in foreignObject elements (a
+    boxed prompt or example) contributes that text instead of an image.
+    """
+
+    def __init__(self, base_url, figures_dir, images=None, svg_as_text=False):
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.figures_dir = figures_dir
+        self._svg_as_text = svg_as_text
+        self._paper_prefix = base_url.rstrip("/")
+        self.parts = {False: [], True: []}
+        self.images = [] if images is None else images
+        self._article = 0
+        self._skip = 0
+        self._math = 0
+        self._figure = 0
+        self._svg = None
+        self._svg_depth = 0
+        self._svg_ignored = 0
+        self._tables = []
+        self._links = []
+
+    def _emit(self, text):
+        self.parts[self._article > 0].append(text)
+
+    def _image(self, source, suffix):
+        name = f"fig{len(self.images) + 1:03d}{suffix}"
+        self.images.append((name, source))
+        shown = name if suffix in _RASTER_SUFFIXES else name + ".png"
+        self._emit(f"\n\n![]({self.figures_dir / shown})\n\n")
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if self._svg is not None:
+            self._svg.append(self.get_starttag_text() or "")
+            self._svg_depth += tag == "svg"
+            return
+        if self._svg_ignored:
+            self._svg_ignored += tag == "svg"
+            return
+        if self._skip or tag in _SKIP_TAGS:
+            self._skip += tag in _SKIP_TAGS
+            return
+        if self._math:
+            self._math += tag == "math"
+            return
+        classes = set((a.get("class") or "").split())
+        if tag == "article":
+            self._article += 1
+        elif tag == "math":
+            latex = a.get("alttext", "")
+            self._emit(f"\n$$\n{latex}\n$$\n" if a.get("display") == "block" else f"${latex}$")
+            self._math = 1
+        elif tag == "svg":
+            # SVG in a figure is figure content; elsewhere it is an icon (ORCID, logos).
+            if self._svg_as_text:
+                pass
+            elif self._figure:
+                self._svg, self._svg_depth = [self.get_starttag_text() or ""], 1
+            else:
+                self._svg_ignored = 1
+        elif tag == "img":
+            src = a.get("src") or ""
+            if src.startswith("data:"):
+                if self._figure:
+                    self._image(src, ".png")
+            else:
+                self._paper_file(src)
+        elif tag == "object" and a.get("data"):
+            self._paper_file(a.get("data") or "")
+        elif tag == "figure":
+            self._figure += 1
+            self._emit("\n\n")
+        elif tag in _TABLE_TAGS:
+            if tag == "table":
+                self._tables.append(not (classes & _EQUATION_TABLE_CLASSES))
+            if self._tables and self._tables[-1]:
+                span = "".join(f' {k}="{escape(v)}"' for k, v in attrs if k in ("colspan", "rowspan") and v)
+                self._emit(f"\n<{tag}{span}>" if tag in ("table", "tr") else f"<{tag}{span}>")
+            elif tag == "tr":
+                self._emit("\n")
+        elif tag in _HEADING_TAGS:
+            self._emit("\n\n" + "#" * _HEADING_TAGS[tag] + " ")
+        elif tag == "li":
+            self._emit("\n- ")
+        elif tag == "a":
+            href = a.get("href") or ""
+            external = urlparse(href).scheme in ("http", "https", "mailto")
+            self._links.append(href if external else None)
+            if external:
+                self._emit("[")
+        elif tag in _BLOCK_TAGS:
+            self._emit("\n")
+
+    def _paper_file(self, ref):
+        url = urljoin(self.base_url, ref)
+        if url.startswith(self._paper_prefix):
+            self._image(url, Path(urlparse(url).path).suffix.lower())
+
+    def handle_startendtag(self, tag, attrs):
+        if self._svg is not None:
+            self._svg.append(self.get_starttag_text() or "")
+            return
+        self.handle_starttag(tag, attrs)
+        if tag in ("svg", "math"):
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if self._svg is not None:
+            self._svg.append(f"</{tag}>")
+            self._svg_depth -= tag == "svg"
+            if self._svg_depth == 0:
+                markup = "".join(self._svg)
+                self._svg = None
+                if "<foreignObject" in markup:
+                    self._emit(self._svg_text(markup))
+                else:
+                    self._image(markup, ".svg")
+            return
+        if self._svg_ignored:
+            self._svg_ignored -= tag == "svg"
+            return
+        if self._skip:
+            self._skip -= tag in _SKIP_TAGS
+            return
+        if self._math:
+            self._math -= tag == "math"
+            return
+        if tag == "article":
+            self._article -= 1
+        elif tag == "figure":
+            self._figure -= 1
+            self._emit("\n\n")
+        elif tag in _TABLE_TAGS:
+            if self._tables and self._tables[-1]:
+                self._emit(f"</{tag}>" + ("\n" if tag == "table" else ""))
+            if tag == "table" and self._tables:
+                self._tables.pop()
+        elif tag in _HEADING_TAGS:
+            self._emit("\n")
+        elif tag == "a" and self._links:
+            href = self._links.pop()
+            if href:
+                self._emit(f"]({href})")
+        elif tag in _BLOCK_TAGS or tag == "li":
+            self._emit("\n")
+
+    def _svg_text(self, markup):
+        """The text of an SVG's foreignObject HTML, as Markdown; its images join this paper's images."""
+        inner = _HtmlMarkdown(self.base_url, self.figures_dir, images=self.images, svg_as_text=True)
+        inner._article = 1
+        inner.feed(markup)
+        inner.close()
+        return "\n\n" + "".join(inner.parts[True]) + "\n\n"
+
+    def handle_data(self, data):
+        if self._svg is not None:
+            self._svg.append(escape(data, quote=False))
+        elif not self._skip and not self._math:
+            self._emit(escape(data, quote=False) if self._tables and self._tables[-1] else data)
+
+    def result(self):
+        in_article = bool(self.parts[True])
+        text = "".join(self.parts[in_article])
+        lines = [
+            line.strip() if line.lstrip().startswith(("#", "<", "$$", "!")) else " ".join(line.split())
+            for line in text.splitlines()
+        ]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
+
+
+def html_to_markdown(html, base_url, figures_dir):
+    """(markdown, images) for an arXiv HTML paper; see _HtmlMarkdown."""
+    parser = _HtmlMarkdown(base_url, figures_dir)
+    parser.feed(html)
+    parser.close()
+    return parser.result(), parser.images
+
+
+def svg_to_png(svg):
+    """PNG bytes of SVG markup, rendered at SVG_SCALE on white."""
+    import skia
+
+    data = svg.encode() if isinstance(svg, str) else svg
+    # SVG inlined in HTML may omit the namespace, which a standalone SVG requires.
+    if b"xmlns=" not in data[: data.find(b">") + 1]:
+        data = data.replace(b"<svg", b'<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    dom = skia.SVGDOM.MakeFromStream(skia.MemoryStream(data))
+    if dom is None:
+        raise ValueError("unreadable SVG")
+    size = dom.containerSize()
+    if size.width() <= 0 or size.height() <= 0:
+        raise ValueError("SVG has no size")
+    surface = skia.Surface(round(size.width() * SVG_SCALE), round(size.height() * SVG_SCALE))
+    with surface as canvas:
+        canvas.clear(skia.ColorWHITE)
+        canvas.scale(SVG_SCALE, SVG_SCALE)
+        dom.render(canvas)
+    return bytes(surface.makeImageSnapshot().encodeToData())
+
+
+def pdf_to_markdown(pdf_path, figures_dir):
+    """Markdown of a PDF, with page-end markers and its figures and formulas as image files in figures_dir."""
+    import pymupdf
+    import pymupdf4llm
+
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    with pymupdf.open(pdf_path) as doc:
+        markdown = pymupdf4llm.to_markdown(
+            doc,
+            write_images=True,
+            image_path=str(figures_dir),
+            page_separators=True,
+            use_ocr=False,
+            header=False,
+            footer=False,
+        )
+    if not isinstance(markdown, str):
+        raise TypeError("the converter returned page chunks instead of Markdown")
+    return markdown
+
+
+async def _fetch_response(http, url):
+    """The final response for url after retrying 429/5xx with backoff; None if no response arrived."""
+    r = None
     for attempt in range(FETCH_ATTEMPTS):
         try:
             r = await http.get(url)
         except httpx.HTTPError:
             r = None
-        if r is not None and r.status_code == 200:
-            return r
         if r is not None and r.status_code != 429 and r.status_code < 500:
-            return None
+            return r
         if attempt < FETCH_ATTEMPTS - 1:
             await asyncio.sleep(2**attempt)
-    return None
+    return r
+
+
+async def _fetch(http, url):
+    """GET a non-S2 URL politely: retries on 429/5xx with backoff, None on failure."""
+    r = await _fetch_response(http, url)
+    return r if r is not None and r.status_code == 200 else None
 
 
 async def save_pdf(http, paper: Paper):
@@ -750,6 +1029,77 @@ async def save_pdf(http, paper: Paper):
     return None
 
 
+async def _save_images(http, images, figures_dir):
+    """Save every image of the page as a file the Read tool shows as an image; True when all were saved."""
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    semaphore = asyncio.Semaphore(IMAGE_CONNECTIONS)
+
+    async def load(source):
+        if source.lstrip().startswith("<svg"):
+            return source.encode()
+        if source.startswith("data:"):
+            return base64.b64decode(source.split(",", 1)[1])
+        async with semaphore:
+            r = await _fetch(http, source)
+        return r.content if r is not None else None
+
+    async def save(name, source):
+        content = await load(source)
+        if content is None:
+            return False
+        if Path(name).suffix in _RASTER_SUFFIXES:
+            (figures_dir / name).write_bytes(content)
+            return True
+        try:
+            (figures_dir / f"{name}.png").write_bytes(await asyncio.to_thread(svg_to_png, content))
+        except ValueError:
+            return False
+        return True
+
+    return all(await asyncio.gather(*(save(name, source) for name, source in images)))
+
+
+async def _arxiv_markdown(http, arxiv_id, figures_dir):
+    """Markdown of the paper's arXiv HTML with its figures saved, or None when that HTML is missing or incomplete.
+
+    HTML that LaTeXML marks with conversion errors, or whose images cannot all
+    be saved, counts as incomplete.
+    """
+    r = await _fetch(http, f"https://arxiv.org/html/{arxiv_id}")
+    if r is None or 'class="ltx_document' not in r.text or "ltx_ERROR" in r.text:
+        return None
+    markdown, images = html_to_markdown(r.text, str(r.url), figures_dir)
+    return markdown if await _save_images(http, images, figures_dir) else None
+
+
+async def save_text(http, paper: Paper, pdf_task):
+    """Path of the paper as Markdown with its figures as image files, or None.
+
+    The text comes from the arXiv HTML version when it is complete, else from
+    the PDF that pdf_task saves.
+    """
+    paper_dir = _cache_dir() / str(paper["paperId"])
+    path = paper_dir / "paper.md"
+    if path.exists():
+        return path
+    figures_dir = paper_dir / "figures"
+    arxiv_id = (paper.get("externalIds") or {}).get("ArXiv")
+    markdown = await _arxiv_markdown(http, arxiv_id, figures_dir) if arxiv_id else None
+    pdf = await pdf_task if markdown is None else None
+    if markdown is None and pdf is not None:
+        shutil.rmtree(figures_dir, ignore_errors=True)
+        try:
+            markdown = await asyncio.to_thread(pdf_to_markdown, pdf, figures_dir)
+        except Exception as exc:
+            print(f"error: {paper['paperId']}: the PDF could not be converted to text: {exc}", file=sys.stderr)
+    if markdown is None:
+        shutil.rmtree(figures_dir, ignore_errors=True)
+        return None
+    paper_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(markdown)
+    return path
+
+
 async def _count(results, cap):
     count = 0
     async for _ in results:
@@ -760,7 +1110,12 @@ async def _count(results, cap):
 
 
 async def read_paper(client, http, paper: Paper, year):
-    pdf = await save_pdf(http, paper)
+    # The PDF downloads while the text is prepared, which needs the PDF only when there is no arXiv HTML.
+    pdf_task = asyncio.ensure_future(save_pdf(http, paper))
+    try:
+        text = await save_text(http, paper, pdf_task)
+    finally:
+        pdf = await pdf_task
     if pdf is None:
         print(
             f"error: {paper['paperId']}: no PDF found (no arXiv or open-access PDF); "
@@ -779,14 +1134,15 @@ async def read_paper(client, http, paper: Paper, year):
         "title": paper.get("title"),
         "year": paper.get("year"),
         "pdfPath": str(pdf) if pdf else None,
+        "textPath": str(text) if text else None,
         "citationCount": paper.get("citationCount"),
         "citationsInRange": in_range,
     }
 
 
 def _with_note(result):
-    """The read result with its reading note: the reminder when a PDF was saved, else None."""
-    return {**result, "note": READ_NOTE if result.get("pdfPath") else None}
+    """The read result with its reading note: the reminder when a copy was saved, else None."""
+    return {**result, "note": READ_NOTE if result.get("pdfPath") or result.get("textPath") else None}
 
 
 def _read_cache_path(paper_id, year):
@@ -796,15 +1152,18 @@ def _read_cache_path(paper_id, year):
 
 
 def _cached_read(paper_id, year):
-    """The saved output of a read made within READ_CACHE_SECONDS whose PDF still exists, or None."""
+    """The saved output of a read made within READ_CACHE_SECONDS whose files still exist, or None."""
     path = _read_cache_path(paper_id, year)
     try:
         saved = json.loads(path.read_text())
     except (FileNotFoundError, ValueError):
         return None
-    if time.time() - saved.get("savedAt", 0) > READ_CACHE_SECONDS or not Path(saved["result"]["pdfPath"]).exists():
+    result = saved.get("result") or {}
+    if time.time() - saved.get("savedAt", 0) > READ_CACHE_SECONDS or "textPath" not in result:
         return None
-    return saved["result"]
+    if not all(Path(result[key]).exists() for key in ("pdfPath", "textPath") if result[key]):
+        return None
+    return result
 
 
 def _save_read(paper_id, year, result):
@@ -957,23 +1316,28 @@ def main():
 
     p = sub.add_parser(
         "read",
-        help="Save a paper's PDF to read with the Read tool, first page to last",
+        help="Save a paper as PDF and Markdown, to read in full",
         description=(
-            "Save each paper's PDF to a local file and print its path as pdfPath. Read that\n"
-            "PDF with the Read tool from the first page to the last before reporting on the\n"
-            "paper. With -y, also count the papers that cite it in a year range."
+            "Save each paper twice, for reading cover to cover before reporting on it: the\n"
+            "PDF, printed as pdfPath, which the Read tool renders page by page, and the full\n"
+            "text as Markdown, printed as textPath, with figures as image files the Read tool\n"
+            "shows as images. With -y, also count the papers that cite it in a year range."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "output: JSON lines, one object per paper:\n"
             "          paperId, title, year, citationCount\n"
             "          pdfPath          the saved PDF, or null when the paper has no PDF\n"
+            "          textPath         the paper's full text as Markdown, from arXiv HTML when\n"
+            "                           it converts cleanly, else from the PDF; figures (and,\n"
+            "                           from the PDF, formulas) are image files linked in the\n"
+            "                           text; null when there is neither\n"
             "          citationsInRange citing papers in the -y range (null without -y; counted\n"
             "                           up to 9999)\n"
-            "          note             reminder to read pdfPath from the first page to the last\n"
-            "                           before reporting on the paper (null when there is no PDF)\n"
-            "reading: a paper counts as read once pdfPath has been read with the Read tool from\n"
-            "        the first page to the last\n"
+            "          note             reminder to read the paper cover to cover from either copy\n"
+            "                           before reporting on it (null when neither was saved)\n"
+            "reading: a paper counts as read once one copy has been read from the first page to\n"
+            "        the last: pdfPath with the Read tool, or textPath with its figure images\n"
             f"ids:    {ID_FORMS}\n"
             "stdin:  reads IDs from piped input when -i is omitted, e.g. from search or citations"
         ),
